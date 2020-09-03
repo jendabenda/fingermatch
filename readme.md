@@ -36,7 +36,7 @@ and fuzzy matching them in another binaries.
 ## Public Python API
  * available to IDA public namespace
  * `fingermatch_collect(filename)` - collects fingerprints and save them into fingerprint database
- * `fingermatch_match(filename)` - loads fingerprints from fingerprint database and match them against current binary
+ * `fingermatch_match(filename)` - loads fingerprints from fingerprint database and match them against analysed binary
 
 
 ## Libraries workflow
@@ -53,7 +53,7 @@ and fuzzy matching them in another binaries.
 
 
 ## Fingerprints
-Function fingerprints are bases on control flow traces allowing to match the same function
+Function fingerprints are based on control flow traces allowing to match the same function
 with shuffled basic block, different register allocation or instruction scheduling.
 Fingerprints of data, types and comments are also matched.
 
