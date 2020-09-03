@@ -34,14 +34,14 @@ and fuzzy matching them in another binaries.
 
 
 ## Public Python API
- * available to IDA public namespace
+ * available from IDA console
  * `fingermatch_collect(filename)` - collects fingerprints and save them into fingerprint database
  * `fingermatch_match(filename)` - loads fingerprints from fingerprint database and match them against analysed binary
 
 
 ## Libraries workflow
  * compile library with debugging symbols (`\Z7` or `\Zi` switch with msvc)
- * autoanalyze binary with IDA
+ * autoanalyze binary with IDA and pdb symbols
  * collect fingerprints with FingerMatch
  * match fingerprints wherever you want
 
