@@ -3,15 +3,15 @@
 IDA plugin for collecting functions, data, types and comments from analysed binaries
 and fuzzy matching them in another binaries.
 
-autor: Jan Prochazka
-licence: none, public domain
-home: https://github.com/jendabenda/fingermatch
+> autor: Jan Prochazka<br>
+> licence: none, public domain<br>
+> home: https://github.com/jendabenda/fingermatch<br>
 
 
 ## Usage
- * fingerprint libraries and then match them in binaries you want to anlayze to save work,
+ * fingerprint libraries and then match them in binaries you want to anlayze,
    you can focus only on unseen and interesting parts
- * resume analysis when new version of previously analyzed binary is out, so you don't need to
+ * resume analysis when new version of previously analyzed binary is out, no need to
    reverse engineer everything from scratch
  * anything what fits
 
