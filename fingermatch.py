@@ -9,7 +9,7 @@ licence: none, public domain
 home: https://github.com/jendabenda/fingermatch
 
 
-Use for
+Useful for
  * fingerprinting libraries and then matching them in binaries you want to anlayze to save work
    focusing only on unseen and interesting parts
  * resuming analysis when new version of previously analyzed binary is out, so you don't need to
@@ -27,7 +27,6 @@ Public Python API
  * available to IDA public namespace
  * fingermatch_collect(filename) - collects fingerprints and save them into filename
  * fingermatch_match(filename) - loads fingerprints from filename and match them against current binary
- * fingermatch_merge(filenames, output_name, exclusions) - merges databases in filenames into
  * using Python API is slow, despite running the same code, IDA developers know the answer
 
 
@@ -58,12 +57,11 @@ Matching process
  * function traces and data hashes are matched as candidates
  * graph of guesses is created from candidates and references between them
  * unambigous candidates for functions and data locations are resolved
+ * algorithm is tuned to output low number of false positives
  * names, types and comments are applied to matched items
-
-
-Merging process
- * several fingerprint databases can be merged into one
- * duplicities are automatically resolved
+ * matched items are written into csv file
+ * unmatched guesses are writen into json file in format
+   { place_ea: { source_ea: [ name_a, name_b, ...], ... }, ... }
 
 
 Functions fingerprints
@@ -85,14 +83,13 @@ register allocation and instruction scheduling within their basic block. Also ma
 should be fast indeed, designed for fail fast strategy and efficient exploration of unknown
 areas. Basically trace is series of hashes with references. One example is
 
-trace = [(12, 0xaf840b37c19a863, 2, 'eeei', True, 0), ..., ...]
-external_crefs = [...]
-external_drefs = [...]
+trace = [(12, 0xaf840b37c19a863, 'cscdi', True, 0), ..., ...]
+external_refs = [...]
 
 Above example is a function consiting of 3 control flow blocks.
 The first one has 12 instructions, their cumulative (and commutative) hash
-is 0xaf840b37c19a863, there are 2 external data references, 3 external code
-references and one internal code reference ('eeei'). Internal references are
+is 0xaf840b37c19a863, there are 1 external data reference, 2 external code
+references and one internal code reference ('cscdi'). Internal references are
 immediately pushed onto matcher stack. True means that matcher should explore
 instructions after the last one (last instruction is likely conditional
 branch) and the last 0 informs matcher to not remove anyting from matcher stack.
@@ -102,17 +99,11 @@ For details see fingerprint_function and match_function_candidates.
 Todo
  * Aho-Corasic style pattern trie links for faster unknown bytes matching
  * data reference linking
- * smarter database merging strategy
+ * rewrite fdb merging
 """
 
-from __future__ import division
-from __future__ import print_function
-
+import os
 import sys
-if sys.version_info[0] == 2:
-    import cPickle as pickle
-else:
-    import pickle
 import csv
 import json
 import bisect
@@ -122,21 +113,28 @@ import importlib
 import gzip
 import io
 import re
+import pickle
+import base64
 
 import idaapi as ida
-import idc
 
 
 signature_size = 32  # length of signature
 strong_match_fn_size = 16  # minimum instructions to consider function strong match
-strong_match_data_size = 16  # minimum size in bytes to consider data strong match
-useless_bytes = set(b'\x00 \x01 \x02 \x04 \x08 \x7f \x80 \xff'.split())  # useless bytes for data fingerprinting
+strong_match_data_size = 10  # minimum size in bytes to consider data strong match
+useless_bytes = set([0x00, 0x01, 0x02, 0x04, 0x08, 0x7f, 0x80, 0xff])  # useless bytes for data fingerprinting
 useful_bytes_count = 3  # minimum number of useful bytes for data fingerprinting
 
 
 class UserInterrupt(Exception):
     """
     Thrown when user cancels running operation
+    """
+    pass
+
+class OperationFailed(Exception):
+    """
+    Thrown when a critical operation failed
     """
     pass
 
@@ -150,10 +148,10 @@ class ProgressBar:
         self.bars = 0
         self.max_bars = 50
         self.char = '='
-        self.start = time.time()
+        self.start = time.monotonic()
 
         sys.stdout.write(text)
-        sys.stdout.write('[')
+        #sys.stdout.write('[')
 
 
     def update(self, value):
@@ -165,7 +163,8 @@ class ProgressBar:
         new_bars = max(0, bars - self.bars)
         self.bars = bars
         if new_bars > 0:
-            sys.stdout.write(self.char * new_bars)
+            #sys.stdout.write(self.char * new_bars)
+            pass
 
         if ida.user_cancelled():
             raise UserInterrupt()
@@ -177,7 +176,8 @@ class ProgressBar:
         """
 
         self.update(1)
-        sys.stdout.write(']  took {:.2f}s\n'.format(time.time() - self.start))
+        #sys.stdout.write(']  took {:.2f}s\n'.format(time.monotonic() - self.start))
+        sys.stdout.write('\n')
 
         if ida.user_cancelled():
             raise UserInterrupt()
@@ -247,23 +247,6 @@ class IntervalTree:
 
             return None
 
-"""
-import random
-iters = 1000
-iv = []
-for n in range(iters):
-    s = random.randint(0, 1000000)
-    iv.append((s, s + random.randint(1, 100), s))
-st = time.time()
-it = IntervalTree(iv)
-print(time.time() - st)
-ss = [random.randint(0, 1000000) for n in range(iters)]
-st = time.time()
-for s in ss:
-    a = it.find(s)
-print(time.time() - st)
-1/0
-"""
 
 class PatternNode:
     """
@@ -339,20 +322,6 @@ class PatternTrie:
         return data, next_nodes
 
 
-"""
-pt = PatternTrie()
-pt.add([0, 6, 9], 'a')
-pt.add([0, 6, 9, 1], 'b')
-pt.add([1, None, 3], 'c')
-pt.add([1, 4, 3], 'd')
-data, nodes = pt.match(1)
-data, nodes = pt.match(4, nodes)
-data, nodes = pt.match(3, nodes)
-print(data, nodes)
-1/0
-"""
-
-
 fnv_start = 0xcbf29ce484222325
 def fnv_hash(hash, num):
     """
@@ -364,7 +333,7 @@ def fnv_hash(hash, num):
 
 def argsort(sequence):
     """
-    Sort sequence indices
+    Return indices of sorted items
     """
 
     return sorted(range(len(sequence)), key=sequence.__getitem__)
@@ -394,19 +363,34 @@ def is_address_fingerprintable(ea, segments):
     return any(1 for name, start, end, type in segments if start <= ea < end)
 
 
+
 def collect_types():
     """
     Return types used for given nodes
     """
 
-    types = []
+    # store type library to tmp file
+    idb = ida.get_path(ida.PATH_TYPE_IDB)
+    til_name = '{}.fingermatch_tmp_til.til'.format(idb)
+    if not ida.store_til(None, None, til_name):
+        raise OperationFailed('cannot export types into a type library {}, current path must be writeable.'.format(til_name))
+
+    # read type library content
+    with open(til_name, 'rb') as fd:
+        til_content = fd.read()
+    os.unlink(til_name)
+    til_content = base64.b64encode(til_content)
+
+    # collect comments
+    meta = []
     ordinal_count = ida.get_ordinal_qty(None)
-    progress = ProgressBar('collecting types\t\t')
+    progress = ProgressBar('collecting types  ')
     for ordinal in range(1, ordinal_count + 1):
         progress.update(ordinal / (ordinal_count + 1))
-        tinfo = ida.get_numbered_type(None, ordinal)
-        if tinfo is None:
+        ttuple = ida.get_numbered_type(None, ordinal)
+        if ttuple is None:
             continue
+        ttuple = ttuple[:3]
 
         name = ida.get_numbered_type_name(None, ordinal)
         sid = ida.get_struc_id(name)
@@ -424,14 +408,14 @@ def collect_types():
                     'cmt_rep': ida.get_member_cmt(member.id, True),
                     'offset': member.soff,
                 })
-            types.append({
+            meta.append({
                 'name': name,
                 'type': 'struct',
-                'tinfo': tinfo,
+                'ttuple': ttuple,
                 'cmt': ida.get_struc_cmt(sid, False),
                 'cmt_rep': ida.get_struc_cmt(sid, True),
                 'members': members,
-                'sync': ida.is_autosync(name, tinfo[0]),
+                'sync': ida.is_autosync(name, ttuple[0]),
             })
         elif enum != ida.BADADDR:
             members = []
@@ -463,26 +447,26 @@ def collect_types():
                         cid, serial = ida.get_next_serial_enum_member(serial, main_cid)
                     value = ida.get_next_enum_member(enum, value)
                 type = 'enum'
-            types.append({
+            meta.append({
                 'name': name,
                 'type': type,
-                'tinfo': tinfo,
+                'ttuple': ttuple,
                 'cmt': ida.get_enum_cmt(enum, False),
                 'cmt_rep': ida.get_enum_cmt(enum, True),
                 'members': members,
-                'sync': ida.is_autosync(name, tinfo[0]),
+                'sync': ida.is_autosync(name, ttuple[0]),
             })
         else:
             # plain types
-            types.append({
+            meta.append({
                 'name': name,
                 'type': 'type',
-                'tinfo': tinfo,
-                'sync': ida.is_autosync(name, tinfo[0]),
+                'ttuple': ttuple,
+                'sync': ida.is_autosync(name, ttuple[0]),
             })
     progress.finish()
 
-    return types
+    return { 'til': til_content, 'meta': meta }
 
 
 def import_types(types):
@@ -490,96 +474,124 @@ def import_types(types):
     Import types from definitions
     """
 
-    type_count = len(types)
-    ordinal_count = ida.get_ordinal_qty(None)
+    # load til
+    idb = ida.get_path(ida.PATH_TYPE_IDB)
+    til_name = '{}.fingermatch_tmp_til.til'.format(idb)
 
-    # collect existing types
-    existing_names = set()
-    for ordinal in range(ordinal_count):
-        existing_names.add(ida.get_numbered_type_name(None, ordinal))
+    # read type library content
+    try:
+        with open(til_name, 'wb') as fd:
+            fd.write(base64.b64decode(types['til']))
+        tlib = ida.load_til(til_name, '.')
+        if tlib is None:
+            raise OperationFailed('cannot import types from type library {}, current path must be readable.'.format(til_name))
+    finally:
+        os.unlink(til_name)
 
-    # collect names to import
-    import_names = set()
-    for type_dict in types:
-        import_names.add(type_dict['name'])
-
-    # import
-    import_names = import_names - existing_names
-    ordinal_base = ida.alloc_type_ordinals(None, len(import_names))
-    ordinal = 0
-    errors = []
+    # apply metadata
+    tindex = None
+    errors = 0
     imported_count = 0
-    progress = ProgressBar('importing types\t\t')
-    for n, type_dict in enumerate(types):
+    type_count = len(types)
+    progress = ProgressBar('importing types  ')
+    for n, type_dict in enumerate(types['meta']):
         progress.update(n / type_count)
+
         name = type_dict['name']
-        tinfo = type_dict['tinfo']
         type = type_dict['type']
         sync = type_dict['sync']
-        if name in import_names:
-            result = ida.set_numbered_type(None, ordinal_base + ordinal, 0, name, *tinfo)
-            if result == ida.TERR_OK:
-                if sync:
-                    ida.import_type(None, -1, name, ida.IMPTYPE_OVERRIDE)
-                if type == 'enum':
-                    # apply enum comments
-                    enum = ida.get_enum(name)
-                    if enum is not None:
-                        ida.set_enum_cmt(enum, type_dict['cmt'], False)
-                        ida.set_enum_cmt(enum, type_dict['cmt_rep'], True)
 
-                        # apply enum member comments
-                        for member in type_dict['members']:
-                            cid = ida.get_enum_member_by_name(member['name'])
-                            ida.set_enum_member_cmt(cid, member['cmt'], False)
-                            ida.set_enum_member_cmt(cid, member['cmt_rep'], True)
-                elif type == 'bitfield':
-                    # apply bitfield comments
-                    enum = ida.get_enum(name)
-                    if enum is not None:
-                        ida.set_enum_cmt(enum, type_dict['cmt'], False)
-                        ida.set_enum_cmt(enum, type_dict['cmt_rep'], True)
+        tinfo = ida.tinfo_t()
+        tinfo.deserialize(tlib, *type_dict['ttuple'])
+        if tindex is None:
+            tindex = ida.alloc_type_ordinal(None)
 
-                        # apply bitfield member comments
-                        for member in type_dict['members']:
-                            ida.set_bmask_cmt(enum, member['bmask'], member['cmt'], False)
-                            ida.set_bmask_cmt(enum, member['bmask'], member['cmt_rep'], True)
-                elif type == 'struct':
-                    # apply struct comments
-                    sid = ida.get_struc_id(name)
-                    struct = ida.get_struc(sid)
-                    if struct is not None:
-                        ida.set_struc_cmt(sid, type_dict['cmt'], False)
-                        ida.set_struc_cmt(sid, type_dict['cmt_rep'], True)
+        if ida.save_tinfo(tinfo, None, tindex, name, ida.NTF_REPLACE) == ida.TERR_OK:
+            tinfo = ida.get_numbered_type(None, tindex)
+            tindex = None
 
-                        # apply struct member comments
-                        for m, member in zip(range(struct.memqty), type_dict['members']):
-                            mptr = struct.get_member(m)
-                            ida.set_member_cmt(mptr, member['cmt'], False)
-                            ida.set_member_cmt(mptr, member['cmt_rep'], True)
+            if sync:
+                ida.import_type(None, -1, name, ida.IMPTYPE_OVERRIDE)
 
-                imported_count += 1
-            else:
-                errors.append(name)
+            if type == 'enum':
+                # apply enum comments
+                enum = ida.get_enum(name)
+                if enum is not None:
+                    ida.set_enum_cmt(enum, type_dict['cmt'], False)
+                    ida.set_enum_cmt(enum, type_dict['cmt_rep'], True)
 
-            ordinal += 1
+                    # apply enum member comments
+                    for member in type_dict['members']:
+                        cid = ida.get_enum_member_by_name(member['name'])
+                        ida.set_enum_member_cmt(cid, member['cmt'], False)
+                        ida.set_enum_member_cmt(cid, member['cmt_rep'], True)
+            elif type == 'bitfield':
+                # apply bitfield comments
+                enum = ida.get_enum(name)
+                if enum is not None:
+                    ida.set_enum_cmt(enum, type_dict['cmt'], False)
+                    ida.set_enum_cmt(enum, type_dict['cmt_rep'], True)
+
+                    # apply bitfield member comments
+                    for member in type_dict['members']:
+                        ida.set_bmask_cmt(enum, member['bmask'], member['cmt'], False)
+                        ida.set_bmask_cmt(enum, member['bmask'], member['cmt_rep'], True)
+            elif type == 'struct':
+                # apply struct comments
+                sid = ida.get_struc_id(name)
+                struct = ida.get_struc(sid)
+                if struct is not None:
+                    ida.set_struc_cmt(sid, type_dict['cmt'], False)
+                    ida.set_struc_cmt(sid, type_dict['cmt_rep'], True)
+
+                    # apply struct member comments
+                    for m, member in zip(range(struct.memqty), type_dict['members']):
+                        mptr = struct.get_member(m)
+                        ida.set_member_cmt(mptr, member['cmt'], False)
+                        ida.set_member_cmt(mptr, member['cmt_rep'], True)
+
+            imported_count += 1
+        else:
+            errors += 1
     progress.finish()
 
     if errors:
-        print('  could not import')
-        for name in errors:
-            print('    {}'.format(name))
+        print('  could not import {} type items'.format(errors))
 
-    return imported_count
+    return tlib, imported_count
 
 
-def fingerprint_instruction(instruction):
+def is_reference(source, target):
+    """
+    Check if source refers to target
+    """
+
+    if ida.getseg(target) is None:
+        return False
+
+    # code references
+    ref = ida.get_first_cref_from(source)
+    while ref != ida.BADADDR:
+        if ref == target and ref != ida.BADADDR:
+            return True
+        ref = ida.get_next_cref_from(source, ref)
+
+    # data references
+    ref = ida.get_first_dref_from(source)
+    while ref != ida.BADADDR:
+        if ref == target and ref != ida.BADADDR:
+            return True
+        ref = ida.get_next_dref_from(source, ref)
+
+    return False
+
+
+def fingerprint_instruction(ea, instruction, check_refs):
     """
     Return fingerprint of an instruction
     """
 
-    crefs = []
-    drefs = []
+    refs = []
     instruction_hash = fnv_start
     instruction_hash = fnv_hash(instruction_hash, instruction.itype)
     ops = instruction.ops
@@ -597,17 +609,25 @@ def fingerprint_instruction(instruction):
         elif otype == ida.o_displ:
             instruction_hash = fnv_hash(instruction_hash, operand.addr)
         else:
-            instruction_hash = fnv_hash(instruction_hash, 0)
+            instruction_hash = fnv_hash(instruction_hash, 0x12345678)
 
-        if operand.type == ida.o_mem:
-            drefs.append((n, operand.addr))
+        if otype == ida.o_mem:
+            if not check_refs or is_reference(ea, operand.addr):
+                refs.append(('d', operand.addr))
+            else:
+                refs.append(None)
         elif otype == ida.o_imm:
-            if ida.getseg(operand.value):
-                drefs.append((n, operand.value))
-        elif operand.type == ida.o_near or operand.type == ida.o_far:
-            crefs.append((n, operand.addr))
+            if not check_refs or is_reference(ea, operand.value):
+                refs.append(('d', operand.value))
+            else:
+                refs.append(None)
+        elif otype == ida.o_near or otype == ida.o_far:
+            if not check_refs or is_reference(ea, operand.addr):
+                refs.append(('c', operand.addr))
+            else:
+                refs.append(None)
 
-    return instruction_hash, crefs, drefs
+    return instruction_hash, refs
 
 
 def fingerprint_function(fn_start, fn_end):
@@ -619,15 +639,14 @@ def fingerprint_function(fn_start, fn_end):
     comments = {}
     comments_rep = {}
     trace = []
-    trace_refs = {}
     trace_block_count = 0
     trace_instruction_count = 0
+    trace_refs = []
     blocks = []
     block_start = None
     block_end = None
     block_next = None
-    block_crefs = []
-    block_dref_count = 0
+    block_refs = []
     block_instruction_count = 0
     block_hash = 0
     block_stack_pops = 0
@@ -643,12 +662,11 @@ def fingerprint_function(fn_start, fn_end):
             if block_instruction_count:
                 if trace:
                     prev = trace[-1]
-                    trace[-1] = (prev[0], prev[1], prev[2], prev[3], prev[4], prev[5] + block_stack_pops)
+                    trace[-1] = (prev[0], prev[1], prev[2], prev[3], prev[4] + block_stack_pops)
                 trace.append((
                     block_instruction_count,
                     block_hash,
-                    block_dref_count,
-                    ''.join(block_crefs),
+                    ''.join(block_refs),
                     block_next,
                     0))
                 trace_block_count += 1
@@ -656,8 +674,7 @@ def fingerprint_function(fn_start, fn_end):
                 block_start = None
                 block_end = None
                 block_next = None
-                block_crefs = []
-                block_dref_count = 0
+                block_refs = []
                 block_instruction_count = 0
                 block_hash = 0
                 block_stack_pops = 0
@@ -680,18 +697,12 @@ def fingerprint_function(fn_start, fn_end):
         block_end = next_ea
 
         # fingerprint instruction
-        instruction_hash, crefs, drefs = fingerprint_instruction(instruction)
+        instruction_hash, refs = fingerprint_instruction(ea, instruction, check_refs=True)
         block_hash = (block_hash + instruction_hash) & 0xffffffffffffffff
         position = (trace_block_count, instruction_hash)
         trace_instruction_count += 1
         block_instruction_count += 1
         block_next = ida.is_flow(ida.get_flags(next_ea))
-
-        # add drefs to trace
-        for n, ref in drefs:
-            refs = trace_refs.setdefault((trace_block_count, instruction_hash, 'd', n), [])
-            refs.append(ref)
-            block_dref_count += 1
 
         # collect comments
         comment = ida.get_cmt(ea, False)
@@ -705,14 +716,20 @@ def fingerprint_function(fn_start, fn_end):
 
         # follow control flow
         internal_crefs = []
-        for n, ref in crefs:
-            if fn_start <= ref < fn_end:
-                block_crefs.append('i')
+        for ref_tuple in refs:
+            if ref_tuple is None:
+                # skip reference
+                block_refs.append('s')
+            elif fn_start <= ref_tuple[1] < fn_end:
+                # internal reference
+                rtype, ref = ref_tuple
+                block_refs.append('i')
                 internal_crefs.append((ref, False))
             else:
-                block_crefs.append('e')
-                refs = trace_refs.setdefault((trace_block_count, instruction_hash, 'c', n), [])
-                refs.append(ref)
+                # external reference
+                rtype, ref = ref_tuple
+                block_refs.append(rtype)
+                trace_refs.append((None, ref))
 
         stack.extend(internal_crefs)
         if block_next:
@@ -721,13 +738,12 @@ def fingerprint_function(fn_start, fn_end):
     # append trace
     if trace:
         prev = trace[-1]
-        trace[-1] = (prev[0], prev[1], prev[2], prev[3], prev[4], prev[5] + block_stack_pops)
+        trace[-1] = (prev[0], prev[1], prev[2], prev[3], prev[4] + block_stack_pops)
     if block_instruction_count:
         trace.append((
             block_instruction_count,
             block_hash,
-            block_dref_count,
-            ''.join(block_crefs),
+            ''.join(block_refs),
             False,
             0))
 
@@ -740,10 +756,12 @@ def fingerprint_functions(segments):
     """
 
     log2 = math.log(2)
-    progress = ProgressBar('  functions\t\t\t')
+
     instruction = ida.insn_t()
-    functions = []
+    tinfo = ida.tinfo_t()
     count = ida.get_func_qty()
+    functions = []
+    progress = ProgressBar('  functions  ')
     for n in range(count):
         progress.update(n / count)
 
@@ -753,8 +771,13 @@ def fingerprint_functions(segments):
         fn_end = function.end_ea
         fn_flags = ida.get_flags(fn_start)
         fn_name = ida.get_name(fn_start)
-        fn_type = idc.get_tinfo(fn_start)
+        if ida.get_tinfo(tinfo, fn_start):
+            fn_type = tinfo.serialize(0)
+        else:
+            fn_type = None
         fn_flags = function.flags
+
+        ida.show_auto(fn_start, ida.AU_USED)
 
         if is_address_fingerprintable(fn_start, segments):
             # signature
@@ -765,7 +788,7 @@ def fingerprint_functions(segments):
             maxn = 0
             while n < size:
                 # first instruction byte
-                signature[n] = ord(signature_bytes[n])
+                signature[n] = signature_bytes[n]
                 instruction_size = ida.decode_insn(instruction, fn_start + n)
                 maxn = n + instruction_size
 
@@ -778,13 +801,14 @@ def fingerprint_functions(segments):
                             op_size = math.ceil(int(math.log(value) / log2 + 1) / 8)
                     op_size = int(min(op_size, instruction_size - op.offb))
                     for o in range(n + op.offb, min(n + op.offb + op_size, signature_size)):
-                        signature[o] = ord(signature_bytes[o])
+                        signature[o] = signature_bytes[o]
 
                 n += instruction_size
             signature = tuple(signature[:maxn])
 
             # function trace
             trace, instruction_count, refs, comments, comments_rep = fingerprint_function(fn_start, fn_end)
+
             if not trace:
                 continue
         else:
@@ -799,8 +823,8 @@ def fingerprint_functions(segments):
             'name': fn_name,
             'size': fn_end - fn_start,
             'tinfo': fn_type,
-            'signature': tuple(signature),
-            'fingerprint': tuple(trace),
+            'signature': tuple(signature) if signature is not None else None,
+            'fingerprint': tuple(trace) if trace is not None else None,
             'refs': refs,
             'cmt': ida.get_func_cmt(function, False),
             'cmt_rep': ida.get_func_cmt(function, True),
@@ -811,28 +835,27 @@ def fingerprint_functions(segments):
             'public': ida.is_public_name(fn_start),
             'weak': ida.is_weak_name(fn_start),
             'strong': instruction_count >= strong_match_fn_size})
-
     progress.finish()
+    ida.show_auto(0, ida.AU_NONE)
+
     return functions
 
 
-def enumerate_refs(ea, block_start, block_end):
+def get_external_reference(ea, block_start, block_end):
     """
-    Enumerate forward references
+    Get forward references
     """
 
-    max_addr = 0xff00000000000000 if idc.__EA64__ else 0xff000000
-    external_refs = []
     xb = ida.xrefblk_t()
     ref = xb.first_from(ea, ida.XREF_ALL)
     while ref:
         to = xb.to
-        if not xb.user and to < max_addr:
-            if not (block_start <= to < block_end):
-                external_refs.append(to)
-        ref = xb.next_from()
+        if block_start <= to < block_end:
+            pass
+        elif ida.getseg(to) is not None:
+            return to
 
-    return external_refs
+        ref = xb.next_from()
 
 
 def fingerprint_data_places(segments):
@@ -840,7 +863,8 @@ def fingerprint_data_places(segments):
     Create fingerprints for data
     """
 
-    progress = ProgressBar('  data\t\t\t')
+    tinfo = ida.tinfo_t()
+    progress = ProgressBar('  data  ')
     data = []
     count = ida.get_nlist_size()
     for n in range(count):
@@ -848,40 +872,35 @@ def fingerprint_data_places(segments):
 
         # collect information
         data_start = ida.get_nlist_ea(n)
+        ida.show_auto(data_start, ida.AU_USED)
+
         flags = ida.get_flags(data_start)
         if not ida.is_data(flags):
             continue
+
         name = ida.get_nlist_name(n)
-
-        if ida.is_struct(flags):
-            tinfo = idc.get_tinfo(data_start)
-            opinfo = ida.opinfo_t()
-            opinfo = ida.get_opinfo(opinfo, data_start, 0, flags)
-            size = ida.get_data_elsize(data_start, flags, opinfo)
+        if ida.get_tinfo(tinfo, data_start):
+            data_type = tinfo.serialize(0)
         else:
-            size = ida.get_item_size(data_start)
-            tinfo = None
-        data_bytes = ida.get_bytes(data_start, size)
-
-        # ignore paddings
-        if all([byte == '\xcc' for byte in data_bytes]):
-            continue
+            data_type = None
+        data_size = ida.get_item_size(data_start)
+        data_bytes = ida.get_bytes(data_start, data_size)
 
         # collect external references
-        data_refs = {}
-        for ea in range(data_start, data_start + size):
-            refs = enumerate_refs(ea, data_start, data_start + size)
-            if refs:
-                data_refs[ea - data_start] = refs
+        data_refs = False
+        for ea in range(data_start, data_start + data_size):
+            ref = get_external_reference(ea, data_start, data_start + data_size)
+            if ref is not None:
+                data_refs = True
 
         # fingerprint
         if (is_address_fingerprintable(data_start, segments) and
             not data_refs and
             sum(1 for byte in data_bytes if byte not in useless_bytes) >= useful_bytes_count):
-            signature = tuple(map(ord, data_bytes[:signature_size]))
+            signature = tuple(data_bytes[:signature_size])
             fingerprint = fnv_start
             for byte in data_bytes:
-                fingerprint = fnv_hash(fingerprint, ord(byte))
+                fingerprint = fnv_hash(fingerprint, byte)
         else:
             signature = None
             fingerprint = None
@@ -901,8 +920,8 @@ def fingerprint_data_places(segments):
             'name': name,
             'type': 'data',
             'ea': data_start,
-            'tinfo': tinfo,
-            'size': size,
+            'tinfo': data_type,
+            'size': data_size,
             'signature': signature,
             'fingerprint': fingerprint,
             'cmt': comments,
@@ -911,9 +930,10 @@ def fingerprint_data_places(segments):
             'user': ida.has_user_name(flags),
             'public': ida.is_public_name(data_start),
             'weak': ida.is_weak_name(data_start),
-            'strong': size >= strong_match_data_size})
-
+            'strong': data_size >= strong_match_data_size})
     progress.finish()
+    ida.show_auto(0, ida.AU_NONE)
+
     return data
 
 
@@ -939,19 +959,16 @@ def resolve_refs(refs, node_intervals, unknowns):
     Resolve node references
     """
 
-    resolved_refs = {}
-    for pos, refs in refs.items():
-        resolved = []
-        for ref in refs:
-            node = node_intervals.find(ref)
-            name, offset = ref_to_symbol(ref, node)
-            if name is None:
-                name = unknowns.setdefault(ref, (len(unknowns),))
+    resolved = []
+    for pos, ref in refs:
+        node = node_intervals.find(ref)
+        name, offset = ref_to_symbol(ref, node)
+        if name is None:
+            name = unknowns.setdefault(ref, (len(unknowns),))
 
-            resolved.append((name, offset))
-        resolved_refs[pos] = tuple(resolved)
+        resolved.append((pos, name, offset))
 
-    return resolved_refs
+    return resolved
 
 
 def save_fdb(filename, db):
@@ -977,7 +994,7 @@ def build_signature_matcher(nodes):
     Builds datastructure for matching signatures
     """
 
-    progress = ProgressBar('building matching structures\t')
+    progress = ProgressBar('building matching structures  ')
     node_count = len(nodes)
     patterns = PatternTrie()
     patterns_unknown = PatternTrie()
@@ -997,7 +1014,7 @@ def verify_strongness(nodes):
     Verifies if strong nodes are unambiguous, possibly removing strong attribute
     """
 
-    progress = ProgressBar('  checking uniqueness\t\t')
+    progress = ProgressBar('  checking uniqueness  ')
     node_count = len(nodes)
     fingerprints = {}
     for n, node in enumerate(nodes):
@@ -1025,23 +1042,30 @@ def collect(filename):
     nodes.extend(fingerprint_data_places(segments))
     node_count = len(nodes)
 
-    print('  fingerprint count\t\t{}'.format(node_count))
+    function_count = 0
+    data_count = 0
+    for node in nodes:
+        if node['type'] == 'function':
+            function_count += 1
+        elif node['type'] == 'data':
+            data_count += 1
+
+    print('  function count  {}'.format(function_count))
+    print('  data count  {}'.format(data_count))
     print('postprocessing')
 
-    node_intervals = IntervalTree([(node['ea'], node['ea'] + node['size'], node) for node in nodes])
-
     # resolve references
-    progress = ProgressBar('  resolving references\t\t')
+    node_intervals = IntervalTree([(node['ea'], node['ea'] + node['size'], node) for node in nodes])
+    progress = ProgressBar('  resolving references  ')
     unknowns = {}
     reference_count = 0
     for n, node in enumerate(nodes):
         progress.update(n / node_count)
         node['refs'] = resolve_refs(node['refs'], node_intervals, unknowns)
-        for pos, refs in node['refs'].items():
-            reference_count += len(refs)
+        reference_count += len(node['refs'])
     progress.finish()
-    print('  reference count\t\t{}'.format(reference_count))
-    print('  reference unknowns\t\t{}'.format(len(unknowns)))
+    print('  reference count  {}'.format(reference_count))
+    print('  reference unknowns  {}'.format(len(unknowns)))
 
     # verify node strongness (must have unique fingerprint)
     verify_strongness(nodes)
@@ -1062,11 +1086,11 @@ def collect(filename):
     types = collect_types()
 
     # pickle fingerprints
-    print('saving fingerprints to\t\t{}'.format(filename))
+    print('saving fingerprints to  {}'.format(filename))
     save_fdb(filename, {
         'nodes': nodes,
         'patterns': patterns,
-        'patterns_unknown': patterns,
+        'patterns_unknown': patterns_unknown,
         'names': names,
         'types': types,
     })
@@ -1074,61 +1098,36 @@ def collect(filename):
     print('done\n')
 
 
-def match_refs(match_ea, match_refs, candidates, names, check=True):
+def match_refs(match_ea, match_refs, candidates, names):
     """
     Match forward refrences to set of candidates
     """
 
-    mpositions = match_refs.keys()
-    mpositions.sort()
-    mcount = len(mpositions)
-    mnames = set(mcandidate['name'] for mcandidate in candidates)
-
     # inspect all candidates
-    survived = []
     guesses = {}
     for candidate in candidates:
-        # check if all references are mached
-        if check:
-            if mcount != len(candidate['refs']):
+        # enumerate candidate refs
+        for mdst, (cpos, cdst, cdst_offset) in zip(match_refs, candidate['refs']):
+            cnode = names.get(cdst)
+            if cnode is None:
+                cname = cdst
+                cea = mdst
+            elif cnode['type'] == 'data':
+                # todo offsets needs to extend guesses with ranges
+                #cname = cnode['name']
+                #cea = mdst - cdst_offset
                 continue
+            elif cnode['type'] == 'function':
+                cname = cnode['name']
+                cea = mdst
+            else:
+                assert False, 'unknown node type {}'.cnode['type']
 
-            cpositions = candidate['refs'].keys()
-            cpositions.sort()
-            if mpositions != cpositions:
-                continue
+            evidence = guesses.setdefault(cea, {})
+            drafts = evidence.setdefault(match_ea, set())
+            drafts.add(cname)
 
-        survived.append(candidate)
-
-        # enumerate positions
-        for pos in mpositions:
-            mrefs = match_refs[pos]
-            crefs = candidate['refs'][pos]
-
-            # match references
-            ceas = []
-            for mdst, (cdst, cdst_offset) in zip(mrefs, crefs):
-                cnode = names.get(cdst)
-                if cnode is None:
-                    cea = mdst
-                elif cnode['type'] == 'data':
-                    cea = mdst - cdst_offset
-                elif cnode['type'] == 'function':
-                    mfunction = ida.get_func(mdst)
-                    if mfunction is None:
-                        cea = mdst
-                    else:
-                        cea = mfunction.start_ea
-                else:
-                    assert False, 'unknown node type {}'.cnode['type']
-                ceas.append(cea)
-
-            # apply names for all candidates
-            for cea in ceas:
-                evidence = guesses.setdefault(match_ea, {})
-                evidence[cea] = evidence.get(cea, set()) | mnames
-
-    return survived, guesses
+    return guesses
 
 
 def merge_guesses(a, b):
@@ -1152,22 +1151,19 @@ def match_function_candidates(start, end, candidates, names, guesses, position_t
     # group candidates to imporove matching performance
     candidate_groups = {}
     for candidate in candidates:
-        group_refs = tuple((pos, len(refs)) for pos, refs in candidate['refs'].items())
-        group_key = (candidate['fingerprint'], group_refs)
-        group = candidate_groups.setdefault(group_key, [])
+        group = candidate_groups.setdefault(candidate['fingerprint'], [])
         group.append(candidate)
 
     # filter candidates by function trace
     survivals = []
-    for (ctrace, crefs), candidate_members in candidate_groups.items():
-        crefs = dict(crefs)
+    for ctrace, candidate_members in candidate_groups.items():
         ctrace_blocks = len(ctrace)
         cposition_to_ea = {}
 
         # function trace compilation and matching
         survived = True
         trace_block_index = 0
-        trace_refs = {}
+        trace_refs = []
         stack = [start]
         while stack:
             ea = stack.pop()
@@ -1179,16 +1175,13 @@ def match_function_candidates(start, end, candidates, names, guesses, position_t
                 mismatch_reason = 'too many trace blocks'
                 survived = False
                 break
-            ccount, chash, cdref_count, ccref_types, cnext, cpops = ctrace[trace_block_index]
+            ccount, chash, cref_types, cnext, cpops = ctrace[trace_block_index]
 
             # fingerprint trace block
-            block_cref_counts = {}
-            block_dref_counts = {}
-            block_crefs = 0
-            block_drefs = 0
+            block_ref_count = 0
             block_hash = 0
-            ccref_count = len(ccref_types)
-            ccref_type_index = 0
+            cref_count = len(cref_types)
+            cref_type_index = 0
             mismatch_reason = None
             for n in range(ccount):
                 # decode instruction
@@ -1199,52 +1192,37 @@ def match_function_candidates(start, end, candidates, names, guesses, position_t
                     break
 
                 # fingerprint instruction
-                instruction_hash, mcrefs, mdrefs = fingerprint_instruction(instruction)
+                instruction_hash, mrefs = fingerprint_instruction(ea, instruction, check_refs=False)
                 block_hash = (block_hash + instruction_hash) & 0xffffffffffffffff
                 cposition_to_ea[(trace_block_index, instruction_hash)] = ea
 
-                # add drefs to trace
-                for n, ref in mdrefs:
-                    pos = (trace_block_index, instruction_hash, 'd', n)
-                    if pos not in crefs:
-                        mismatch_reason = 'dref {} not found among candidate refs'.format((trace_block_index, pos))
-                        survived = False
-                        break
-                    refs = trace_refs.setdefault(pos, [])
-                    refs.append(ref)
-                    block_dref_counts[pos] = block_dref_counts.setdefault(pos, 0) + 1
-                    block_drefs += 1
-                if not survived:
-                    break
-
-                # add crefs to trace
-                for n, ref in mcrefs:
-                    if ccref_type_index >= ccref_count:
-                        mismatch_reason = 'block {} has more crefs than expected'.format(trace_block_index)
+                # add refs to trace
+                for r, (rtype, mref) in enumerate(mrefs):
+                    if cref_type_index + r >= cref_count:
+                        mismatch_reason = 'block {} has more refs than expected'.format(trace_block_index)
                         survived = False
                         break
 
-                    pos = (trace_block_index, instruction_hash, 'c', n)
-                    ccref_type = ccref_types[ccref_type_index]
-
-                    if ccref_type == 'i':
-                        stack.append(ref)
-                    elif ccref_type == 'e':
-                        if pos not in crefs:
-                            mismatch_reason = 'cref {} not found among candidate refs'.format((trace_block_index, pos))
+                    cref_type = cref_types[cref_type_index + r]
+                    if cref_type == 's':
+                        pass
+                    elif cref_type == 'i':
+                        stack.append(mref)
+                    elif cref_type in 'cd':
+                        if rtype != cref_type:
+                            mismatch_reason = 'ref type mismatch at {}'.format((trace_block_index, r))
                             survived = False
                             break
-                        refs = trace_refs.setdefault(pos, [])
-                        refs.append(ref)
-                        block_cref_counts[pos] = block_cref_counts.setdefault(pos, 0) + 1
+                        trace_refs.append(mref)
                     else:
-                        assert False, 'unknown cref type {}'.format(ccref_type)
+                        assert False, 'unknown ref type {} at {}'.format(cref_type, (trace_block_index, r))
 
-                    block_crefs += 1
-                    ccref_type_index += 1
+                    block_ref_count += 1
+
                 if not survived:
                     break
 
+                cref_type_index = block_ref_count
                 ea += size
             if not survived:
                 break
@@ -1255,15 +1233,9 @@ def match_function_candidates(start, end, candidates, names, guesses, position_t
                 survived = False
                 break
 
-            # check dref counts
-            if block_drefs != cdref_count or any(crefs[pos] != count for pos, count in block_dref_counts.items()):
-                mismatch_reason = 'dref counts does not match in block {}'.format(trace_block_index)
-                survived = False
-                break
-
-            # check cref counts
-            if block_crefs != len(ccref_types) or any(crefs[pos] != count for pos, count in block_cref_counts.items()):
-                mismatch_reason = 'cref counts does not match in block {}'.format(trace_block_index)
+            # check ref counts
+            if block_ref_count != len(cref_types):
+                mismatch_reason = 'ref counts does not match in block {}'.format(trace_block_index)
                 survived = False
                 break
 
@@ -1273,7 +1245,7 @@ def match_function_candidates(start, end, candidates, names, guesses, position_t
 
             # clear stack
             if len(stack) < cpops:
-                mismatch_reason = 'block {} does not have enough working stack space to advance'.format(trace_block_index)
+                mismatch_reason = 'matching stack is missing refs at block {}'.format(trace_block_index)
                 survived = False
                 break
             if cpops:
@@ -1284,17 +1256,14 @@ def match_function_candidates(start, end, candidates, names, guesses, position_t
         # was candidate succesful match?
         if survived:
             survivals = candidate_members
-            refs = trace_refs
             break
 
     if not survived:
         return
     candidates = survivals
 
-    # check references
-    candidates, guesses_from_refs = match_refs(start, trace_refs, candidates, names, check=False)
-    if not candidates:
-        return
+    # match references
+    guesses_from_refs = match_refs(start, trace_refs, candidates, names)
 
     # update position to ea map
     for candidate in candidates:
@@ -1318,18 +1287,20 @@ def match_functions(segments, patterns, names, guesses, position_to_ea):
     """
 
     # enumerate and match functions
-    explored_ranges = []
+    explored = []
     count = ida.get_func_qty()
-    progress = ProgressBar('  functions\t\t\t')
+    progress = ProgressBar('  functions  ')
     for n in range(count):
         progress.update(n / count)
 
         function = ida.getn_func(n)
         fn_start = function.start_ea
         fn_end = function.end_ea
-        explored_ranges.append((fn_start, fn_end))
+        explored.append((fn_start, fn_end))
         if not is_address_fingerprintable(fn_start, segments):
             continue
+
+        ida.show_auto(fn_start, ida.AU_USED)
 
         # signature match
         size = min(fn_end - fn_start, signature_size)
@@ -1337,7 +1308,7 @@ def match_functions(segments, patterns, names, guesses, position_to_ea):
         snodes = None
         candidates = []
         for n in range(size):
-            candidates, snodes = patterns.match(ord(signature_bytes[n]), snodes)
+            candidates, snodes = patterns.match(signature_bytes[n], snodes)
             if not snodes:
                 candidates = []
                 break
@@ -1347,10 +1318,10 @@ def match_functions(segments, patterns, names, guesses, position_to_ea):
 
         # match candidates function trace
         match_function_candidates(fn_start, fn_end, candidates, names, guesses, position_to_ea)
-
     progress.finish()
+    ida.show_auto(0, ida.AU_NONE)
 
-    return explored_ranges
+    return explored
 
 
 def match_data_candidates(start, data_bytes, candidates, guesses):
@@ -1358,12 +1329,12 @@ def match_data_candidates(start, data_bytes, candidates, guesses):
     Match data candidates on given binary location
     """
 
-    if all(byte == '\xff' for byte in data_bytes):
+    if all(byte == 0xff for byte in data_bytes):
         return
 
     fingerprint = fnv_start
     for n, byte in enumerate(data_bytes):
-        fingerprint = fnv_hash(fingerprint, ord(byte))
+        fingerprint = fnv_hash(fingerprint, byte)
     candidates = [c for c in candidates if c['fingerprint'] == fingerprint]
     if not candidates:
         return
@@ -1384,35 +1355,30 @@ def match_data(segments, patterns, names, guesses):
 
     # enumerate and match data
     count = ida.get_nlist_size()
-    explored_ranges = []
-    progress = ProgressBar('  data\t\t\t')
+    explored = []
+    progress = ProgressBar('  data  ')
     for n in range(count):
         progress.update(n / count)
 
         # collect information
         data_start = ida.get_nlist_ea(n)
         flags = ida.get_flags(data_start)
-
-        if ida.is_struct(flags):
-            opinfo = ida.opinfo_t()
-            opinfo = ida.get_opinfo(opinfo, data_start, 0, flags)
-            size = ida.get_data_elsize(data_start, flags, opinfo)
-        else:
-            size = ida.get_item_size(data_start)
-        explored_ranges.append((data_start, data_start + size))
+        data_size = ida.get_item_size(data_start)
+        explored.append((data_start, data_start + data_size))
 
         if not ida.is_data(flags):
             continue
         if not is_address_fingerprintable(data_start, segments):
             continue
 
-        data_bytes = ida.get_bytes(data_start, size)
+        ida.show_auto(data_start, ida.AU_USED)
+        data_bytes = ida.get_bytes(data_start, data_size)
 
         # signature match
         snodes = None
         candidates = []
-        for n in range(min(size, signature_size)):
-            candidates, snodes = patterns.match(ord(data_bytes[n]), snodes)
+        for n in range(min(data_size, signature_size)):
+            candidates, snodes = patterns.match(data_bytes[n], snodes)
             if not snodes:
                 candidates = []
                 break
@@ -1423,164 +1389,214 @@ def match_data(segments, patterns, names, guesses):
         # fingerprint match
         match_data_candidates(data_start, data_bytes, candidates, guesses)
     progress.finish()
+    ida.show_auto(0, ida.AU_NONE)
 
-    return explored_ranges
+    return explored
 
 
-def prune_guesses(guesses, strong_guesses, match_eas, match_names):
+def prune_guesses(guesses, matched_eas, matched_names):
     """
     Prune guesses based on matched evidence
     """
 
     # prune guesses
-    for ea in match_eas:
-        del guesses[ea]
+    for ea in matched_eas:
+        if ea in guesses:
+            del guesses[ea]
 
-    # prune evidence drafts by strong matches
-    match_names_set = set(match_names.keys())
+    # prune evidence drafts by matched items
+    matched_names_set = set(matched_names)
     for ea, evidence in guesses.items():
-        for source in evidence.keys():
-            evidence[source] -= match_names_set
+        for source in list(evidence):
+            evidence[source] -= matched_names_set
             if not evidence[source]:
                 del evidence[source]
 
-    # prune evidence drafts by strong source drafts domination
+    # prune evidence source by matched items
     for ea, evidence in guesses.items():
-        strong_drafts = set()
-        for source, drafts in evidence.items():
-            if source in match_eas:
-                strong_drafts |= drafts
-        if strong_drafts:
-            strong_guesses.add(ea)
-            for source in evidence.keys():
-                evidence[source] &= strong_drafts
-                if not evidence[source]:
+        strong_sources = set(source for source in evidence if source in matched_eas)
+        if strong_sources:
+            for source in list(evidence):
+                if source not in strong_sources:
                     del evidence[source]
 
     # prune empty guesses
-    for ea in guesses.keys():
+    for ea in list(guesses):
         if not guesses[ea]:
             del guesses[ea]
 
 
-def match_evidence_level(level, matches, matched_names, guesses, strong_guesses):
+def match_evidence(matched_eas, matched_names, guesses, names):
     """
     Match items from evidence fingerprints at given evel
     """
 
-    print('  {} evidence'.format(level))
+    unambiguous_eas = {}
+    unambiguous_refs = {}
     while True:
-        # collect matches
-        new_match_names = {}
-        new_match_eas = set()
-        ambiguous_names = set()
-        for ea, evidence in guesses.items():
-            if level == 'undeniable':
-                level_condition = 'strong' in evidence and len(evidence) >= 2
-            elif level == 'strong':
-                level_condition = 'strong' in evidence
-            elif level == 'good':
-                level_condition = len(evidence) >= 3
-            elif level == 'weak':
-                level_condition = len(evidence) >= 2 and matches
-            elif level == 'doubtful':
-                level_condition = len(evidence) >= 1 and matches
-            else:
-                assert False, 'unknown evidence level {}'.format(level)
+        if ida.user_cancelled():
+            raise UserInterrupt()
 
-            if level_condition or ea in strong_guesses:
-                drafts = evidence.values()
-                if not drafts:
+        # find unambiguous candidates
+        added = True
+        new_unambiguous_eas = {}
+        while added:
+            added = False
+            for ea, evidence in guesses.items():
+                if ea in unambiguous_eas:
                     continue
-                draft_intersection = set.intersection(*drafts)
-                if len(draft_intersection) == 1:
-                    match = draft_intersection.pop()
-                    # test for ambiguity
-                    if match in new_match_names:
-                        ambiguous_names.add(match)
-                    elif match in matched_names:
-                        pass
-                    else:
-                        new_match_names[match] = ea
-                        new_match_eas.add(ea)
+                drafts = set.intersection(*evidence.values())
+                if (len(drafts) == 1 and
+                    any(isinstance(source, str) or source in unambiguous_eas for source in evidence)):
+                    draft = drafts.pop()
+                    if draft not in matched_names:
+                        new_unambiguous_eas[ea] = draft
+                        unambiguous_eas[ea] = draft
+                        added = True
 
-            if ida.user_cancelled():
-                raise UserInterrupt()
+        # find unambiguous references
+        for ea in new_unambiguous_eas:
+            for source in guesses.get(ea, []):
+                if source in unambiguous_eas:
+                    refs = unambiguous_refs.setdefault(source, set())
+                    refs.add(ea)
+                    refs = unambiguous_refs.setdefault(ea, set())
+                    refs.add(source)
 
-        # remove ambiguous matches
-        for match in ambiguous_names:
-            ea = new_match_names[match]
-            new_match_eas.remove(ea)
-            del new_match_names[match]
+        # create unambiguous subgraphs
+        subgraphs = []
+        visited = set()
+        for ea in unambiguous_eas:
+            if ea in matched_eas:
+                continue
 
-        if not new_match_names:
+            subgraph = set()
+            stack = [ea]
+            while stack:
+                ea = stack.pop()
+                if ea in visited:
+                    continue
+
+                subgraph.add(ea)
+                visited.add(ea)
+                if ea in unambiguous_refs:
+                    stack.extend(unambiguous_refs[ea])
+            if subgraph:
+                subgraphs.append(subgraph)
+
+        # score subgraphs
+        score_strong = 3
+        score_weak = 1
+        score_threshold = 3
+        score_conflict = -1
+        strong_subgraphs = []
+        for graph in subgraphs:
+            score = 0
+            for ea in graph:
+                name = unambiguous_eas[ea]
+                if name in names and names[name]['strong']:
+                    score += score_strong
+                else:
+                    score += score_weak
+            if score >= score_threshold:
+                strong_subgraphs.append((score, graph))
+        strong_subgraphs.sort(key=lambda score_graph: -score_graph[0])
+
+        # inspect all strong subgraphs
+        new_matched_eas = {}
+        new_matched_names = {}
+        used_names = set()
+        for score, graph in strong_subgraphs:
+            # check name conflicts
+            conflicts = set()
+            for ea in graph:
+                name = unambiguous_eas[ea]
+                if name in used_names:
+                    score += 2 * score_conflict if name in conflicts else score_conflict
+                    conflicts.add(name)
+                used_names.add(name)
+
+            if score < score_threshold:
+                continue
+
+            # add graph to matches
+            for ea in graph:
+                if ea in matched_eas:
+                    continue
+
+                name = unambiguous_eas[ea]
+                if name in conflicts:
+                    continue
+
+                new_matched_eas[ea] = name
+                new_matched_names[name] = ea
+
+        if not new_matched_eas:
             break
 
-        # add new matches to all matches
-        for match, ea in new_match_names.items():
-            matches[ea] = match
-            matched_names[match] = ea
+        matched_eas.update(new_matched_eas)
+        matched_names.update(new_matched_names)
 
         # prune guesses
-        prune_guesses(guesses, strong_guesses, new_match_eas, new_match_names)
+        prune_guesses(guesses, new_matched_eas, new_matched_names)
 
-        print('    matches | guesses\t\t{} | {}'.format(len(matches), len(guesses)))
+    # print results
+    data_count = 0
+    function_count = 0
+    for ea, name in matched_eas.items():
+        node = names.get(name)
+        if node is not None and node['type'] == 'function':
+            function_count +=  1
+        elif node is not None and node['type'] == 'data':
+            data_count +=  1
+
+    print('  function matches  {}'.format(function_count))
+    print('  data matches  {}'.format(data_count))
+    print('  leftover guesses  {}'.format(len(guesses)))
 
 
-def match_evidence(matches, matched_names, guesses, strong_guesses):
-    """
-    Match items from evidence fingerprints
-    """
-
-    match_evidence_level('undeniable', matches, matched_names, guesses, strong_guesses)
-    match_evidence_level('strong', matches, matched_names, guesses, strong_guesses)
-    match_evidence_level('good', matches, matched_names, guesses, strong_guesses)
-    #match_evidence_level('weak', matches, matched_names, guesses, strong_guesses)
-    #match_evidence_level('doubtful', matches, matched_names, guesses, strong_guesses)
-
-
-def match_unknown(segments, explored, patterns, names, guesses, position_to_ea):
+def match_unknown(segments, explored, patterns, names, guesses, position_to_ea, exclude):
     """
     Match unknown areas
     """
 
     # build interval tree for explored areas
-    explored_intervals = IntervalTree([(start, end, end) for start, end in explored])
+    explored_intervals = IntervalTree([(start, end, end) for start, end in explored if end - start >= signature_size])
 
     # enumerate segments
     for name, segment_start, segment_end, segment_type in list_segments():
-        progress = ProgressBar('  unknown in {}\t\t'.format(name))
+        progress = ProgressBar('  segment {}  '.format(name))
         segment_size = segment_end - segment_start
         segment_bytes = ida.get_bytes(segment_start, segment_size)
-        segment_snodes = [None] * segment_size
 
         # collect candidates for each byte
         n = 0
         while n < segment_size:
-            # skip already explored areas
             progress.update(n / segment_size)
+
+            # skip already explored areas
             interval_end = explored_intervals.find(segment_start + n)
             if interval_end is not None:
                 n = interval_end - segment_start
                 continue
 
             # find candidates inside moving window
-            byte = ord(segment_bytes[n])
-            for s in range(max(0, n - 32), n):
-                if segment_snodes[s] is None:
-                    segment_snodes[s] = []
-                prev_snodes = segment_snodes[s]
-                candidates, snodes = patterns.match(byte, prev_snodes)
-                segment_snodes[s] = snodes
+            snodes = None
+            start = segment_start + n
+            ida.show_auto(start, ida.AU_USED)
+            for s in range(n, min(n + signature_size, segment_size)):
+                candidates, snodes = patterns.match(segment_bytes[s], snodes)
+                if not snodes:
+                    break
 
-                fn_candidates = [c for c in candidates if c['type'] == 'function']
-                data_candidates = [c for c in candidates if c['type'] == 'data']
-                start = segment_start + s
-                end = segment_end + s
+                fn_candidates = [c for c in candidates if c['type'] == 'function'
+                    if exclude is None or c['name'] not in exclude]
+                data_candidates = [c for c in candidates if c['type'] == 'data'
+                    if exclude is None or c['name'] not in exclude]
 
                 # match functions
                 if fn_candidates:
-                    match_function_candidates(start, end, fn_candidates, names, guesses, position_to_ea)
+                    match_function_candidates(start, segment_end, fn_candidates, names, guesses, position_to_ea)
 
                 # match data
                 if data_candidates:
@@ -1590,144 +1606,59 @@ def match_unknown(segments, explored, patterns, names, guesses, position_to_ea):
                         group.append(candidate)
 
                     for size, candidates in sizes.items():
+                        if start + size >= segment_end:
+                            continue
                         match_data_candidates(start, segment_bytes[start:start + size], candidates, guesses)
-
-            # no need to check candidates here, length 1 candidates does not exist
-            segment_snodes[n] = patterns.match(byte)[1]
 
             n += 1
         progress.finish()
+        ida.show_auto(0, ida.AU_NONE)
 
 
-def match(filename):
+def apply_matches(matched_eas, names, type_lib, explored, position_to_ea):
     """
-    Matches db against fingerprints
+    Aplies matched items
     """
 
-    # unpickle fingerprints
-    print('loading fingerprints from\t{}'.format(filename))
-    db = load_fdb(filename)
-    nodes = db['nodes']
-    patterns = db['patterns']
-    names = db['names']
-    types = db['types']
-
-    # print info
-    print('  fingerprints\t\t{}'.format(len(nodes)))
-
-    # match fingerprints
-    print('matching')
-    segments = list_segments()
-
-    guesses = {}
-    position_to_ea = {}
-    explored = []
-    explored.extend(match_functions(segments, patterns, names, guesses, position_to_ea))
-    explored.extend(match_data(segments, patterns, names, guesses))
-    match_unknown(segments, explored, patterns, names, guesses, position_to_ea)
-
-    # match items based on fingerprint evidence
-    matches = {}
-    matched_names = {}
-    strong_guesses = set()
-    match_evidence(matches, matched_names, guesses, strong_guesses)
-
-    # print results
-    data_count = 0
-    function_count = 0
-    for ea, name in matches.items():
-        node = names.get(name)
-        if node is not None and node['type'] == 'function':
-            function_count +=  1
-        elif node is not None and node['type'] == 'data':
-            data_count +=  1
-
-    print('  function matches\t\t{}'.format(function_count))
-    print('  data matches\t\t{}'.format(data_count))
-    print('  leftover guesses\t\t{}'.format(len(guesses)))
-
-    # save matches
-    idb = ida.get_path(ida.PATH_TYPE_IDB)
-    idb_matches = '{}.fingermatch_matches.csv'.format(idb)
-    print('writing matches into \t\t{}'.format(idb_matches))
-
-    with open(idb_matches, 'wt') as fd:
-        writer = csv.writer(fd)
-        for ea, name in matches.items():
-            node = names.get(name)
-            if node is not None:
-                writer.writerow([hex(int(ea)), node['type'], name])
-
-    # save guesses
-    idb_guesses = '{}.fingermatch_guesses.json'.format(idb)
-    print('writing leftover guesses into \t{}'.format(idb_guesses))
-
-    json_guesses = {}
-    for ea, evidence in guesses.items():
-        json_evidence = {}
-        for source, drafts in evidence.items():
-            if not isinstance(source, str):
-                json_drafts = [draft if isinstance(draft, str) else 'unknown_{}'.format(draft[0]) for draft in drafts]
-                json_evidence[hex(int(source))] = sorted(json_drafts)
-
-        if not json_evidence:
-            continue
-        json_guesses[hex(int(ea))] = json_evidence
-
-    with open(idb_guesses, 'wt') as fd:
-        json.dump(json_guesses, fd, indent=2, sort_keys=True)
-
-    # import types
-    matched_functions = 0
-    for ea, name in matches.items():
-        if names[name]['type'] == 'function':
-            matched_functions += 1
-    if matched_functions:
-        imported_types = import_types(types)
-    else:
-        print('did not match any functions, skipping other matches')
-        return
-
-    # apply names, types and comments to matches
-    progress = ProgressBar('applying meta to matches\t')
-    match_count = len(matches)
-    tinfo = ida.tinfo_t()
-    matched_functions = 0
-    matched_data = 0
-    imported_comments = 0
-    for n, (ea, name) in enumerate(matches.items()):
+    progress = ProgressBar('applying matches  ')
+    match_count = len(matched_eas)
+    applied_functions = 0
+    applied_data = 0
+    applied_comments = 0
+    applied_names = {}
+    for n, (ea, name) in enumerate(matched_eas.items()):
         progress.update(n / match_count)
-        if not isinstance(name, str):
+        if name not in names:
             continue
+
+        ida.show_auto(ea, ida.AU_LIBF)
 
         # name
         node = names[name]
-        sn_flags = ida.SN_NOCHECK | ida.SN_FORCE
-        if node['public']:
-            sn_flags |= ida.SN_PUBLIC
-        else:
-            sn_flags |= ida.SN_NON_PUBLIC
-        if node['weak']:
-            sn_flags |= ida.SN_WEAK
-        else:
-            sn_flags |= ida.SN_NON_WEAK
-        ida.set_name(ea, name, sn_flags)
-
-        # type
-        if node['tinfo'] is not None:
-            tinfo.deserialize(None, *node['tinfo'])
-            ida.apply_tinfo(ea, tinfo, ida.TINFO_GUESSED)
+        if node['user']:
+            sn_flags = ida.SN_NOCHECK | ida.SN_FORCE
+            if node['public']:
+                sn_flags |= ida.SN_PUBLIC
+            else:
+                sn_flags |= ida.SN_NON_PUBLIC
+            if node['weak']:
+                sn_flags |= ida.SN_WEAK
+            else:
+                sn_flags |= ida.SN_NON_WEAK
+            ida.set_name(ea, name, sn_flags)
 
         # comments, flags
         if node['type'] == 'data':
             for pos, comment in node['cmt'].items():
                 ida.set_cmt(ea + pos, comment, False)
-                imported_comments += 1
+                applied_comments += 1
             for pos, comment in node['cmt_rep'].items():
                 ida.set_cmt(ea + pos, comment, True)
-                imported_comments += 1
+                applied_comments += 1
 
-            matched_data += 1
+            explored.append((ea, ea + node['size']))
+            applied_names[ea] = name
+            applied_data += 1
         elif node['type'] == 'function':
             function = ida.get_func(ea)
             if function is None:
@@ -1740,28 +1671,126 @@ def match(filename):
             function.flags = node['flags']
             if node['cmt'] is not None:
                 ida.set_func_cmt(function, node['cmt'], False)
-                imported_comments += 1
+                applied_comments += 1
             if node['cmt_rep'] is not None:
                 ida.set_func_cmt(function, node['cmt_rep'], True)
-                imported_comments += 1
+                applied_comments += 1
 
             for pos, comments in node['code_cmt'].items():
                 if (name, ea) in position_to_ea:
                     ida.set_cmt(position_to_ea[(name, ea)][pos], '\n'.join(comments), False)
-                    imported_comments += 1
+                    applied_comments += 1
             for pos, comments in node['code_cmt_rep'].items():
                 if (name, ea) in position_to_ea:
                     ida.set_cmt(position_to_ea[(name, ea)][pos], '\n'.join(comments), True)
-                    imported_comments += 1
+                    applied_comments += 1
 
-            matched_functions += 1
+            explored.append((ea, function.end_ea))
+            applied_names[ea] = name
+            applied_functions += 1
+
+        # type
+        if node['tinfo'] is not None:
+            tinfo = ida.tinfo_t()
+            tinfo.deserialize(type_lib, *node['tinfo'])
+            if ida.parse_decl(tinfo, None, str(tinfo) + ';', ida.PT_SIL) is not None:
+                ida.set_tinfo(ea, tinfo)
     progress.finish()
+    ida.show_auto(0, ida.AU_NONE)
 
-    print('statistics')
-    print('  matched functions\t\t{}'.format(matched_functions))
-    print('  matched data \t\t{}'.format(matched_data))
-    print('  imported types \t\t{}'.format(imported_types))
-    print('  imported comments \t\t{}'.format(imported_comments))
+    return applied_names, (applied_functions, applied_data, applied_comments)
+
+
+def save_matches(filename, matched_eas, names):
+    """
+    Save matches to a csv file
+    """
+
+    print('writing matches into  {}'.format(filename))
+
+    with open(filename, 'wt', encoding='utf8') as fd:
+        writer = csv.writer(fd)
+        for ea, name in sorted(matched_eas.items()):
+            node = names.get(name)
+            if node is not None:
+                writer.writerow([hex(ea), node['type'], name])
+
+
+def save_guesses(filename, guesses, names):
+    """
+    Save guesses into json file
+    """
+    print('writing guesses into  {}'.format(filename))
+
+    json_guesses = {}
+    for ea, evidence in guesses.items():
+        json_evidence = {}
+        for source, drafts in evidence.items():
+            json_drafts = [draft if draft in names else 'unknown_{}'.format(draft[0]) for draft in drafts]
+            json_source = source if isinstance(source, str) else hex(source)
+            json_evidence[json_source] = sorted(json_drafts)
+
+        if not json_evidence:
+            continue
+        json_guesses[hex(ea)] = json_evidence
+
+    with open(filename, 'wt', encoding='utf8') as fd:
+        json.dump(json_guesses, fd, indent=2, sort_keys=True)
+
+
+def match(filename):
+    """
+    Matches db against fingerprints
+    """
+
+    # unpickle fingerprints
+    print('loading fingerprints from  {}'.format(filename))
+    db = load_fdb(filename)
+    nodes = db['nodes']
+    patterns = db['patterns']
+    patterns_unknown = db['patterns_unknown']
+    names = db['names']
+    types = db['types']
+
+    print('  fingerprints  {}'.format(len(nodes)))
+
+    # match fingerprints
+    print('matching')
+    guesses = {}
+    position_to_ea = {}
+    explored = []
+    segments = list_segments()
+    explored.extend(match_functions(segments, patterns, names, guesses, position_to_ea))
+    explored.extend(match_data(segments, patterns, names, guesses))
+    match_unknown(segments, explored, patterns_unknown, names, guesses, position_to_ea, None)
+
+    # resolve matches based on collected evidence
+    matched_eas = {}
+    matched_names = {}
+    match_evidence(matched_eas, matched_names, guesses, names)
+
+    # import types
+    if any(name in names and names[name]['type'] == 'function' for name in matched_names):
+        type_lib, imported_types = import_types(types)
+    else:
+        print('did not match any functions, done\n')
+        return
+
+    # apply names
+    applied, counts = apply_matches(matched_eas, names, type_lib, explored, position_to_ea)
+    fns_first, data_first, cmts_first = counts
+
+    # save matches and guesses
+    idb = ida.get_path(ida.PATH_TYPE_IDB)
+    save_matches('{}.fingermatch_matches.csv'.format(idb), matched_eas, names)
+    save_guesses('{}.fingermatch_guesses.json'.format(idb), guesses, names)
+
+    print('results')
+    print('  imported types  {}'.format(imported_types))
+    print('  applied functions  {}'.format(fns_first))
+    print('  applied data  {}'.format(data_first))
+    print('  applied comments  {}'.format(cmts_first))
+    print('done\n')
 
 
 def fingermatch_merge(filenames, output_name, exclusions=None):
@@ -1772,6 +1801,9 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
     exclusions: list of regexps, names matching any of these will be excluded
     """
 
+    # todo rewrite for the new fdb format
+    print('Not implemented yet')
+    """
     if exclusions is None:
         exclusions = []
 
@@ -1781,7 +1813,7 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
     # load databases
     fdbs = {}
     for filename in filenames:
-        print('loading fingerprints from\t{}'.format(filename))
+        print('loading fingerprints from  {}'.format(filename))
         fdbs[filename] = load_fdb(filename)
 
     names = {}
@@ -1792,7 +1824,7 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
     # find functions conflicts
     name_to_function = {}
     all_functions = 0
-    progress = ProgressBar('  functions\t\t\t')
+    progress = ProgressBar('  functions  ')
     for filename, fdb in fdbs.items():
         for node in fdb['nodes']:
             if node['type'] == 'function':
@@ -1822,7 +1854,7 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
 
     # remove ambiguous data
     unambiguous_data = []
-    progress = ProgressBar('  data\t\t\t')
+    progress = ProgressBar('  data  ')
     for name, data in name_to_data.items():
         if len(data) == 1:
             unambiguous_data.append(data[0])
@@ -1842,7 +1874,7 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
     # remove ambiguous types
     unambiguous_types = []
     count = len(name_to_type)
-    progress = ProgressBar('  types\t\t\t')
+    progress = ProgressBar('  types  ')
     for n, (name, types) in enumerate(name_to_type.items()):
         progress.update(n / count)
         tinfos = [type['tinfo'] for type in types]
@@ -1850,9 +1882,9 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
             unambiguous_types.append(types[0])
     progress.finish()
 
-    print('  used functions\t\t{} / {}'.format(len(unambiguous_functions), all_functions))
-    print('  used data\t\t\t{} / {}'.format(len(unambiguous_data), all_data))
-    print('  used types\t\t\t{} / {}'.format(len(unambiguous_types), all_types))
+    print('  used functions  {} / {}'.format(len(unambiguous_functions), all_functions))
+    print('  used data  {} / {}'.format(len(unambiguous_data), all_data))
+    print('  used types  {} / {}'.format(len(unambiguous_types), all_types))
 
     print('postprocessing')
 
@@ -1868,7 +1900,7 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
     unknown_count = 0
     all_ref_count = 0
     node_count = len(nodes)
-    progress = ProgressBar('  cleaning references\t\t')
+    progress = ProgressBar('  cleaning references  ')
     for n, node in enumerate(nodes):
         progress.update(n / node_count)
         for pos, refs in node['refs'].items():
@@ -1883,7 +1915,7 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
                 all_ref_count += 1
             node['refs'][pos] = cleaned_refs
     progress.finish()
-    print('  cleaned references\t\t{} / {}'.format(unknown_count, all_ref_count))
+    print('  cleaned references  {} / {}'.format(unknown_count, all_ref_count))
 
     # verify node strongness (must have unique fingerprint)
     verify_strongness(nodes)
@@ -1892,7 +1924,7 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
     patterns, patterns_unknown = build_signature_matcher(nodes)
 
     # pickle fingerprints
-    print('saving fingerprints to\t\t{}'.format(output_name))
+    print('saving fingerprints to  {}'.format(output_name))
     save_fdb(output_name, {
         'nodes': nodes,
         'patterns': patterns,
@@ -1900,6 +1932,7 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
         'names': names,
         'types': unambiguous_types,
     })
+    """
 
 
 def fingermatch_collect(filename):
@@ -1912,7 +1945,9 @@ def fingermatch_collect(filename):
     try:
         collect(filename)
     except UserInterrupt:
-        print('user interrupted')
+        print('user interrupted collecting fingerprints\n')
+    except OperationFailed as exception:
+        print(exception)
     finally:
         ida.hide_wait_box()
 
@@ -1927,7 +1962,9 @@ def fingermatch_match(filename):
     try:
         match(filename)
     except UserInterrupt:
-        print('user interrupted')
+        print('user interrupted matching fingerprints\n')
+    except OperationFailed as exception:
+        print(exception)
     finally:
         ida.hide_wait_box()
 
@@ -1950,8 +1987,11 @@ def remove_api(names):
 
     module = sys.modules['__main__']
     for name in names:
-        delattr(module, name)
-    del sys.modules['fingermatch']
+        if hasattr(module, name):
+            delattr(module, name)
+
+    if 'fingermatch' in sys.modules:
+        del sys.modules['fingermatch']
 
 
 class FingerprintAction(ida.action_handler_t):
@@ -2026,6 +2066,10 @@ class FingerMatch(ida.plugin_t):
         Initialize plugin, add menu items to IDA UI
         """
 
+        if sys.version_info[0] <= 2:
+            print('FingerMatch supports Python 3+, you are using older version.')
+            return ida.PLUGIN_SKIP
+
         action_collect = ida.action_desc_t(
             'fingerprints_collect',
             'Collect fingerprints',
@@ -2071,16 +2115,12 @@ class FingerMatch(ida.plugin_t):
         Run plugin, show help
         """
 
-        ida.info('FingerMatch plugin\n\nTo collect fingerprints go to View -> collect fingerprints.\nTo match stored fingerprints go to View -> match fingerprints.')
+        ida.info('FingerMatch plugin\n\nTo collect fingerprints go to View -> Collect fingerprints.\nTo match stored fingerprints go to View -> Match fingerprints.')
 
 
 def PLUGIN_ENTRY():
     """
     FingerMatch IDA plugin entrypoint
     """
-
-    if ida.IDA_SDK_VERSION < 700:
-        print('FingerMatch is requires IDA 7.0 and newer versions.')
-        return
 
     return FingerMatch()
