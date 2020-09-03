@@ -9,7 +9,7 @@ licence: none, public domain
 home: https://github.com/jendabenda/fingermatch
 
 
-Useful for
+Usage
  * fingerprinting libraries and then matching them in binaries you want to anlayze to save work
    focusing only on unseen and interesting parts
  * resuming analysis when new version of previously analyzed binary is out, so you don't need to
