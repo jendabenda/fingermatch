@@ -19,6 +19,7 @@ and fuzzy matching them in another binaries.
 ## Features
  * fuzzy function matching
  * data, types, comments matching
+ * can correctly match small functions
  * easy to use
 
 
@@ -55,6 +56,8 @@ and fuzzy matching them in another binaries.
 ## Fingerprints
 Function fingerprints are based on control flow traces allowing to match the same function
 with shuffled basic block, different register allocation or instruction scheduling.
-Fingerprints of data, types and comments are also matched.
+Fingerprints of data, types and comments are also matched. In addition matching considers
+whole reference graph, so it has high chance to pinpoint correct names. Matching is tuned
+to have low false positive matches.
 
 Detailed documentation is at the begining of the `fingermatch.py` file.
