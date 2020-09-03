@@ -9,8 +9,8 @@ home: https://github.com/jendabenda/fingermatch
 
 
 ## Usage
- * fingerprint libraries and then matching them in binaries you want to anlayze to save work
-   focusing only on unseen and interesting parts
+ * fingerprint libraries and then match them in binaries you want to anlayze to save work,
+   you can focus only on unseen and interesting parts
  * resume analysis when new version of previously analyzed binary is out, so you don't need to
    reverse engineer everything from scratch
  * anything what fits
