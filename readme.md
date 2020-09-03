@@ -18,6 +18,7 @@ home: https://github.com/jendabenda/fingermatch
 
 ## Installation
  * copy `fingermatch.py` into `IDA-path/plugins`
+ * works with IDA 7.2 other versions will be tested soon
 
 
 ## UI
