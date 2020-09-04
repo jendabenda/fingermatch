@@ -99,9 +99,9 @@ Todo
  * Aho-Corasic style pattern trie links for faster unknown bytes matching
  * data reference linking
  * rewrite fdb merging
+ * change fdb format to gzipped json
 """
 
-import os
 import sys
 import csv
 import json
@@ -113,7 +113,6 @@ import gzip
 import io
 import re
 import pickle
-import base64
 
 import idaapi as ida
 
@@ -362,26 +361,84 @@ def is_address_fingerprintable(ea, segments):
     return any(1 for name, start, end, type in segments if start <= ea < end)
 
 
+def escape_cpp(match):
+    """
+    Escape cpp template chars
+    """
+
+    text = match.group(0)
+    text = text.replace('_fme_', '_fme__fme_')
+    text = text.replace('<', '_fme_a_')
+    text = text.replace('>', '_fme_b_')
+    text = text.replace(',', '_fme_c_')
+    text = text.replace('*', '_fme_d_')
+    text = text.replace('&', '_fme_e_')
+    text = text.replace(':', '_fme_f_')
+    text = text.replace(' ', '_fme_g_')
+    text = text.replace('-', '_fme_h_')
+    text = text.replace('"', '_fme_i_')
+    text = text.replace("'", '_fme_j_')
+
+    return text
+
+
+def unescape_type(text):
+    """
+    Unescape cpp names
+    """
+
+
+    text = text.replace('_fme_a_', '<')
+    text = text.replace('_fme_b_', '>')
+    text = text.replace('_fme_c_', ',')
+    text = text.replace('_fme_d_', '*')
+    text = text.replace('_fme_e_', '&')
+    text = text.replace('_fme_f_', ':')
+    text = text.replace('_fme_g_', ' ')
+    text = text.replace('_fme_h_', '-')
+    text = text.replace('_fme_i_', '"')
+    text = text.replace('_fme_j_', "'")
+    text = text.replace('_fme__fme_', '_fme_')
+
+    return text
+
+
+def escape_type(text):
+    """
+    Escape cpp names
+    """
+
+    escape_re = re.compile('(<[^<>]*>)')
+    while '<' in text and '>' in text:
+        text = escape_re.sub(escape_cpp, text)
+
+    return text
+
+
+def insert_function_name(tdecl, name):
+    """
+    Insert function name into tupe declaration
+    """
+
+    brackets = 0
+    for n, c in enumerate(reversed(tdecl)):
+        if c == ')':
+            brackets += 1
+        elif c == '(':
+            brackets -= 1
+            if brackets == 0 and n > 0:
+                return '{} {}{}'.format(tdecl[:-n - 1], name, tdecl[-n - 1:])
+
+    return tdecl
+
 
 def collect_types():
     """
     Return types used for given nodes
     """
 
-    # store type library to tmp file
-    idb = ida.get_path(ida.PATH_TYPE_IDB)
-    til_name = '{}.fingermatch_tmp_til.til'.format(idb)
-    if not ida.store_til(None, None, til_name):
-        raise OperationFailed('cannot export types into a type library {}, current path must be writeable.'.format(til_name))
-
-    # read type library content
-    with open(til_name, 'rb') as fd:
-        til_content = fd.read()
-    os.unlink(til_name)
-    til_content = base64.b64encode(til_content)
-
     # collect comments
-    meta = []
+    types = []
     ordinal_count = ida.get_ordinal_qty(None)
     progress = ProgressBar('collecting types  ')
     for ordinal in range(1, ordinal_count + 1):
@@ -389,7 +446,13 @@ def collect_types():
         ttuple = ida.get_numbered_type(None, ordinal)
         if ttuple is None:
             continue
-        ttuple = ttuple[:3]
+
+        name = ida.get_numbered_type_name(None, ordinal)
+        tinfo = ida.tinfo_t()
+        tinfo.deserialize(None, *ttuple[:3])
+        tdecl = tinfo._print(None, ida.PRTYPE_1LINE | ida.PRTYPE_SEMI | ida.PRTYPE_TYPE)
+        if ida.parse_decl(tinfo, None, escape_type(tdecl), ida.PT_SIL) is None:
+            continue
 
         name = ida.get_numbered_type_name(None, ordinal)
         sid = ida.get_struc_id(name)
@@ -407,10 +470,10 @@ def collect_types():
                     'cmt_rep': ida.get_member_cmt(member.id, True),
                     'offset': member.soff,
                 })
-            meta.append({
+            types.append({
                 'name': name,
                 'type': 'struct',
-                'ttuple': ttuple,
+                'tdecl': tdecl,
                 'cmt': ida.get_struc_cmt(sid, False),
                 'cmt_rep': ida.get_struc_cmt(sid, True),
                 'members': members,
@@ -446,10 +509,10 @@ def collect_types():
                         cid, serial = ida.get_next_serial_enum_member(serial, main_cid)
                     value = ida.get_next_enum_member(enum, value)
                 type = 'enum'
-            meta.append({
+            types.append({
                 'name': name,
                 'type': type,
-                'ttuple': ttuple,
+                'tdecl': tdecl,
                 'cmt': ida.get_enum_cmt(enum, False),
                 'cmt_rep': ida.get_enum_cmt(enum, True),
                 'members': members,
@@ -457,64 +520,71 @@ def collect_types():
             })
         else:
             # plain types
-            meta.append({
+            types.append({
                 'name': name,
                 'type': 'type',
-                'ttuple': ttuple,
+                'tdecl': tdecl,
                 'sync': ida.is_autosync(name, ttuple[0]),
             })
     progress.finish()
 
-    return { 'til': til_content, 'meta': meta }
+    return types
 
 
 def import_types(types):
     """
-    Import types from definitions
+    Import types from definitions.
+    IDA cannot cope with cpp names so they need to be escaped first and then
+    renamed back after all types are applied.
     """
 
-    # load til
-    idb = ida.get_path(ida.PATH_TYPE_IDB)
-    til_name = '{}.fingermatch_tmp_til.til'.format(idb)
+    # collect existing types
+    existing = {}
+    ordinal_count = ida.get_ordinal_qty(None)
+    for ordinal in range(1, ordinal_count + 1):
+        name = ida.get_numbered_type_name(None, ordinal)
+        if name is not None:
+            existing[name] = ordinal
 
-    # read type library content
-    try:
-        with open(til_name, 'wb') as fd:
-            fd.write(base64.b64decode(types['til']))
-        tlib = ida.load_til(til_name, '.')
-        if tlib is None:
-            raise OperationFailed('cannot import types from type library {}, current path must be readable.'.format(til_name))
-    finally:
-        os.unlink(til_name)
-
-    # apply metadata
+    # import types
     tindex = None
-    errors = 0
-    imported_count = 0
-    type_count = len(types)
-    progress = ProgressBar('importing types  ')
-    for n, type_dict in enumerate(types['meta']):
-        progress.update(n / type_count)
+    imported = {}
+    new_imported = {}
+    print('importing types')
+    while True:
+        for n, type_dict in enumerate(types):
+            name = type_dict['name']
+            tdecl = type_dict['tdecl']
+            type = type_dict['type']
+            sync = type_dict['sync']
+            if name in imported:
+                continue
 
-        name = type_dict['name']
-        type = type_dict['type']
-        sync = type_dict['sync']
+            tdecl_escaped = escape_type(tdecl)
+            name_escaped = escape_type(name)
 
-        tinfo = ida.tinfo_t()
-        tinfo.deserialize(tlib, *type_dict['ttuple'])
-        if tindex is None:
-            tindex = ida.alloc_type_ordinal(None)
+            tinfo = ida.tinfo_t()
+            if ida.parse_decl(tinfo, None, tdecl_escaped, ida.PT_SIL) is None:
+                continue
 
-        if ida.save_tinfo(tinfo, None, tindex, name, ida.NTF_REPLACE) == ida.TERR_OK:
-            tinfo = ida.get_numbered_type(None, tindex)
+            if name in existing:
+                tindex = existing[name]
+            elif tindex is None:
+                tindex = ida.alloc_type_ordinal(None)
+
+            ttuple = tinfo.serialize()
+            if ida.set_numbered_type(None, tindex, ida.NTF_REPLACE, name_escaped, *ttuple) != ida.TERR_OK:
+                continue
+
+            new_imported[name] = (name_escaped, tindex, tinfo)
             tindex = None
 
             if sync:
-                ida.import_type(None, -1, name, ida.IMPTYPE_OVERRIDE)
+                ida.import_type(None, -1, name_escaped, ida.IMPTYPE_OVERRIDE)
 
             if type == 'enum':
                 # apply enum comments
-                enum = ida.get_enum(name)
+                enum = ida.get_enum(name_escaped)
                 if enum is not None:
                     ida.set_enum_cmt(enum, type_dict['cmt'], False)
                     ida.set_enum_cmt(enum, type_dict['cmt_rep'], True)
@@ -526,7 +596,7 @@ def import_types(types):
                         ida.set_enum_member_cmt(cid, member['cmt_rep'], True)
             elif type == 'bitfield':
                 # apply bitfield comments
-                enum = ida.get_enum(name)
+                enum = ida.get_enum(name_escaped)
                 if enum is not None:
                     ida.set_enum_cmt(enum, type_dict['cmt'], False)
                     ida.set_enum_cmt(enum, type_dict['cmt_rep'], True)
@@ -537,7 +607,7 @@ def import_types(types):
                         ida.set_bmask_cmt(enum, member['bmask'], member['cmt_rep'], True)
             elif type == 'struct':
                 # apply struct comments
-                sid = ida.get_struc_id(name)
+                sid = ida.get_struc_id(name_escaped)
                 struct = ida.get_struc(sid)
                 if struct is not None:
                     ida.set_struc_cmt(sid, type_dict['cmt'], False)
@@ -549,15 +619,34 @@ def import_types(types):
                         ida.set_member_cmt(mptr, member['cmt'], False)
                         ida.set_member_cmt(mptr, member['cmt_rep'], True)
 
-            imported_count += 1
-        else:
-            errors += 1
-    progress.finish()
+        if not new_imported:
+            break
 
-    if errors:
-        print('  could not import {} type items'.format(errors))
+        imported.update(new_imported)
+        new_imported = {}
 
-    return tlib, imported_count
+    return imported
+
+
+def import_types_rename(imported):
+    """
+    Renamed escaped types to original form
+    """
+
+    renamed = set()
+    while True:
+        new_renamed = set()
+        for name, (name_escaped, tindex, tinfo) in imported.items():
+            if name in renamed:
+                continue
+
+            if name != name_escaped:
+                if tinfo.set_numbered_type(None, tindex, ida.NTF_REPLACE, unescape_type(name_escaped)) == ida.TERR_OK:
+                    new_renamed.add(name)
+
+        if not new_renamed:
+            break
+        renamed |= new_renamed
 
 
 def is_reference(source, target):
@@ -691,7 +780,9 @@ def fingerprint_function(fn_start, fn_end):
         size = ida.decode_insn(instruction, ea)
         if size == 0:
             block_next = False
+            block_end = ea
             continue
+
         next_ea = ea + size
         block_end = next_ea
 
@@ -771,7 +862,7 @@ def fingerprint_functions(segments):
         fn_flags = ida.get_flags(fn_start)
         fn_name = ida.get_name(fn_start)
         if ida.get_tinfo(tinfo, fn_start):
-            fn_type = tinfo.serialize(0)
+            fn_type = tinfo._print(None, ida.PRTYPE_1LINE | ida.PRTYPE_SEMI)
         else:
             fn_type = None
         fn_flags = function.flags
@@ -821,7 +912,7 @@ def fingerprint_functions(segments):
             'type': 'function',
             'name': fn_name,
             'size': fn_end - fn_start,
-            'tinfo': fn_type,
+            'tdecl': fn_type,
             'signature': tuple(signature) if signature is not None else None,
             'fingerprint': tuple(trace) if trace is not None else None,
             'refs': refs,
@@ -879,7 +970,7 @@ def fingerprint_data_places(segments):
 
         name = ida.get_nlist_name(n)
         if ida.get_tinfo(tinfo, data_start):
-            data_type = tinfo.serialize(0)
+            data_type = tinfo._print(None, ida.PRTYPE_1LINE | ida.PRTYPE_SEMI)
         else:
             data_type = None
         data_size = ida.get_item_size(data_start)
@@ -919,7 +1010,7 @@ def fingerprint_data_places(segments):
             'name': name,
             'type': 'data',
             'ea': data_start,
-            'tinfo': data_type,
+            'tdecl': data_type,
             'size': data_size,
             'signature': signature,
             'fingerprint': fingerprint,
@@ -976,7 +1067,7 @@ def save_fdb(filename, db):
     """
 
     with io.BufferedWriter(gzip.open(filename, 'wb')) as fd:
-        pickle.dump(db, fd, pickle.HIGHEST_PROTOCOL)
+        pickle.dump(db, fd, 3)  # Python 3.0+ compatible
 
 
 def load_fdb(filename):
@@ -1113,9 +1204,12 @@ def match_refs(match_ea, match_refs, candidates, names):
                 cea = mdst
             elif cnode['type'] == 'data':
                 # todo offsets needs to extend guesses with ranges
-                #cname = cnode['name']
-                #cea = mdst - cdst_offset
-                continue
+                if cdst_offset == 0:
+                    cname = cnode['name']
+                    cea = mdst
+                else:
+                    #cea = mdst - cdst_offset
+                    continue
             elif cnode['type'] == 'function':
                 cname = cnode['name']
                 cea = mdst
@@ -1430,6 +1524,7 @@ def match_evidence(matched_eas, matched_names, guesses, names):
     Match items from evidence fingerprints at given evel
     """
 
+    print('resolving guesses')
     unambiguous_eas = {}
     unambiguous_refs = {}
     while True:
@@ -1501,7 +1596,7 @@ def match_evidence(matched_eas, matched_names, guesses, names):
                 strong_subgraphs.append((score, graph))
         strong_subgraphs.sort(key=lambda score_graph: -score_graph[0])
 
-        # inspect all strong subgraphs
+        # inspect all strong subgraphs, create matches
         new_matched_eas = {}
         new_matched_names = {}
         used_names = set()
@@ -1551,7 +1646,7 @@ def match_evidence(matched_eas, matched_names, guesses, names):
 
     print('  function matches  {}'.format(function_count))
     print('  data matches  {}'.format(data_count))
-    print('  leftover guesses  {}'.format(len(guesses)))
+    print('  unresolved guesses  {}'.format(len(guesses)))
 
 
 def match_unknown(segments, explored, patterns, names, guesses, position_to_ea, exclude):
@@ -1614,7 +1709,7 @@ def match_unknown(segments, explored, patterns, names, guesses, position_to_ea, 
         ida.show_auto(0, ida.AU_NONE)
 
 
-def apply_matches(matched_eas, names, type_lib, explored, position_to_ea):
+def apply_matches(matched_eas, names, imported_types, explored, position_to_ea):
     """
     Aplies matched items
     """
@@ -1689,13 +1784,19 @@ def apply_matches(matched_eas, names, type_lib, explored, position_to_ea):
             applied_functions += 1
 
         # type
-        if node['tinfo'] is not None:
+        if node['tdecl'] is not None:
+            if node['type'] == 'function':
+                tdecl_escaped = insert_function_name(escape_type(node['tdecl']), 'placeholder')
+            else:
+                tdecl_escaped = escape_type(node['tdecl'])
+
             tinfo = ida.tinfo_t()
-            tinfo.deserialize(type_lib, *node['tinfo'])
-            if ida.parse_decl(tinfo, None, str(tinfo) + ';', ida.PT_SIL) is not None:
+            if ida.parse_decl(tinfo, None, tdecl_escaped, ida.PT_SIL) is not None:
                 ida.set_tinfo(ea, tinfo)
+
     progress.finish()
     ida.show_auto(0, ida.AU_NONE)
+    import_types_rename(imported_types)
 
     return applied_names, (applied_functions, applied_data, applied_comments)
 
@@ -1770,13 +1871,13 @@ def match(filename):
 
     # import types
     if any(name in names and names[name]['type'] == 'function' for name in matched_names):
-        type_lib, imported_types = import_types(types)
+        imported_types = import_types(types)
     else:
         print('did not match any functions, done\n')
         return
 
     # apply names
-    applied, counts = apply_matches(matched_eas, names, type_lib, explored, position_to_ea)
+    applied, counts = apply_matches(matched_eas, names, imported_types, explored, position_to_ea)
     fns_first, data_first, cmts_first = counts
 
     # save matches and guesses
@@ -1785,7 +1886,7 @@ def match(filename):
     save_guesses('{}.fingermatch_guesses.json'.format(idb), guesses, names)
 
     print('results')
-    print('  imported types  {}'.format(imported_types))
+    print('  imported types  {}'.format(len(imported_types)))
     print('  applied functions  {}'.format(fns_first))
     print('  applied data  {}'.format(data_first))
     print('  applied comments  {}'.format(cmts_first))
@@ -2123,3 +2224,5 @@ def PLUGIN_ENTRY():
     """
 
     return FingerMatch()
+#fingermatch_match('/tmp/a.fdb')
+#collect_types()
