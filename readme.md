@@ -25,16 +25,16 @@ and fuzzy matching them in another binaries.
 
 ## Installation
  * works with IDA 7.4+, Python 3
- * copy `fingermatch.py` into `/plugins` folder of IDA
+ * copy `fingermatch.py` into IDA `/plugins` folder
 
 
 ## UI
- * menu `View -> Collect fingerprints` - collects fingerprints and save them into filename
+ * menu `View -> Collect fingerprints` - collects fingerprints and save them into fingerprint database
  * menu `View -> Match fingerprints` - loads fingerprints from filename and match them against
-   current binary
+   analysed binary
 
 
-## Public Python API
+## Python API
  * available from IDA console
  * `fingermatch_collect(filename)` - collects fingerprints and save them into fingerprint database
  * `fingermatch_match(filename)` - loads fingerprints from fingerprint database and match them against analysed binary
