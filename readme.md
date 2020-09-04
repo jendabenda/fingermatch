@@ -45,6 +45,8 @@ and fuzzy matching them in another binaries.
  * autoanalyze binary with IDA and pdb symbols
  * collect fingerprints with FingerMatch
  * match fingerprints wherever you want
+ * you can download example databases
+   (`zlib`, `libpng`, `libtiff`, `openssl`, `cryptopp`) from [here](https://drive.google.com/drive/folders/18lJni0rIBH1islpEpekMwIQH0ak6mF1i?usp=sharing)
 
 ## Resumption workflow
  * open binary, analyze it
