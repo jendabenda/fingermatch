@@ -25,7 +25,7 @@ and fuzzy matching them in another binaries.
 
 ## Installation
  * works with IDA 7.4+, Python 3
- * copy `fingermatch.py` into IDA `/plugins` folder
+ * copy `fingermatch.py` into IDA `plugins` folder
 
 
 ## UI

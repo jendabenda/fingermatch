@@ -9,45 +9,12 @@ licence: none, public domain
 home: https://github.com/jendabenda/fingermatch
 
 
-Usage
- * fingerprinting libraries and then matching them in binaries you want to anlayze to save work
-   focusing only on unseen and interesting parts
- * resuming analysis when new version of previously analyzed binary is out, so you don't need to
-   reverse engineer everything from "scratch"
- * anything what fits
-
-
-UI
- * menu View -> Collect fingerprints - collects fingerprints and save them into filename
- * menu View -> Match fingerprints - loads fingerprints from filename and match them against
-   current binary
-
-
-Public Python API
- * available to IDA public namespace
- * fingermatch_collect(filename) - collects fingerprints and save them into fingerprint database
- * fingermatch_match(filename) - loads fingerprints from fingerprint database and match them against current binary
-
-
-Libraries workflow
- * compile library with debugging symbols (\Z7 or \Zi switch with msvc)
- * autoanalyze binary with IDA
- * collect fingerprints with FingerMatch
- * match fingerprints whenever you want
-
-Resumption workflow
- * open binary, analyze it
- * collect fingerprints with FingerMatch
- * when new version is out, open new version
- * match saved fingerprints
-
-
 Collection process
- * functions - function traces and function referencees
- * data - hashes and data references
- * types
- * comments
- * all metadata of above
+ * collect functions - function traces and function referencees
+ * collect data - hashes and data references
+ * collect types
+ * collect comments
+ * collect metadata of all above
  * save to FingerMatch database
 
 
@@ -82,7 +49,7 @@ register allocation and instruction scheduling within their basic block. Also ma
 should be fast indeed, designed for fail fast strategy and efficient exploration of unknown
 areas. Basically trace is series of hashes with references. One example is
 
-trace = [(12, 0xaf840b37c19a863, 'cscdi', True, 0), ..., ...]
+trace = [(12, 0xaf840b37c19a863, 'cscdi', True, 0), (...), (...)]
 external_refs = [...]
 
 Above example is a function consiting of 3 control flow blocks.
@@ -129,6 +96,7 @@ class UserInterrupt(Exception):
     Thrown when user cancels running operation
     """
     pass
+
 
 class OperationFailed(Exception):
     """
@@ -355,7 +323,7 @@ def list_segments():
 
 def is_address_fingerprintable(ea, segments):
     """
-    Test if segment is usable for fingerprinting
+    Test if address is usable for fingerprinting
     """
 
     return any(1 for name, start, end, type in segments if start <= ea < end)
@@ -386,7 +354,6 @@ def unescape_type(text):
     """
     Unescape cpp names
     """
-
 
     text = text.replace('_fme_a_', '<')
     text = text.replace('_fme_b_', '>')
@@ -1072,7 +1039,7 @@ def save_fdb(filename, db):
 
 def load_fdb(filename):
     """
-    Loads fingermatch database
+    Load fingermatch database
     """
 
     with io.BufferedReader(gzip.open(filename, 'rb')) as fd:
@@ -1081,7 +1048,7 @@ def load_fdb(filename):
 
 def build_signature_matcher(nodes):
     """
-    Builds datastructure for matching signatures
+    Build datastructure for matching signatures
     """
 
     progress = ProgressBar('building matching structures  ')
@@ -1101,7 +1068,7 @@ def build_signature_matcher(nodes):
 
 def verify_strongness(nodes):
     """
-    Verifies if strong nodes are unambiguous, possibly removing strong attribute
+    Verify if strong nodes are unambiguous, possibly removing strong attribute
     """
 
     progress = ProgressBar('  checking uniqueness  ')
@@ -2224,5 +2191,3 @@ def PLUGIN_ENTRY():
     """
 
     return FingerMatch()
-#fingermatch_match('/tmp/a.fdb')
-#collect_types()
