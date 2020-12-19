@@ -886,7 +886,7 @@ def fingerprint_functions(segments):
             'cmt_rep': ida.get_func_cmt(function, True),
             'code_cmt': comments,
             'code_cmt_rep': comments_rep,
-            'user': ida.has_user_name(fn_flags),
+            'user': not ida.has_dummy_name(fn_flags),
             'flags':  fn_flags,
             'public': ida.is_public_name(fn_start),
             'weak': ida.is_weak_name(fn_start),
@@ -983,7 +983,7 @@ def fingerprint_data_places(segments):
             'cmt': comments,
             'cmt_rep': comments_rep,
             'refs': {},
-            'user': ida.has_user_name(flags),
+            'user': not ida.has_dummy_name(flags),
             'public': ida.is_public_name(data_start),
             'weak': ida.is_weak_name(data_start),
             'strong': data_size >= strong_match_data_size})
@@ -1037,7 +1037,7 @@ class SaveUnpickler(pickle.Unpickler):
         Restrict classes that can be unpickled.
         """
 
-        if module != __name__ or name not in ('PatternTrie', 'PatternNode'):
+        if name not in ('PatternTrie', 'PatternNode'):
             raise pickle.UnpicklingError('Unknown object to load {}.{}'.format(module, name))
 
         return super().find_class(module, name)
