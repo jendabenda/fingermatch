@@ -44,7 +44,7 @@ Data fingerprints
 
 
 Function traces are fingerprint parts for matching functions. They are designed so they
-match the same function, but the function can have shuffled basic blocks, different
+match the same function, but the function can have shuffled basic block starts, different
 register allocation and instruction scheduling within their basic block. Also matching
 should be fast indeed, designed for fail fast strategy and efficient exploration of unknown
 areas. Basically trace is series of hashes with references. One example is
@@ -66,7 +66,6 @@ Todo
  * Aho-Corasic style pattern trie links for faster unknown bytes matching
  * data reference linking
  * rewrite fdb merging
- * change fdb format to gzipped json
 """
 
 import sys
@@ -84,9 +83,9 @@ import pickle
 import idaapi as ida
 
 
-signature_size = 32  # length of signature
-strong_match_fn_size = 16  # minimum instructions to consider function strong match
-strong_match_data_size = 10  # minimum size in bytes to consider data strong match
+signature_size = 32  # length of function/data signature
+strong_match_fn_size = 16  # minimum instructions to consider function a strong match
+strong_match_data_size = 10  # minimum size in bytes to consider data a strong match
 useless_bytes = set([0x00, 0x01, 0x02, 0x04, 0x08, 0x7f, 0x80, 0xff])  # useless bytes for data fingerprinting
 useful_bytes_count = 3  # minimum number of useful bytes for data fingerprinting
 
@@ -1028,6 +1027,22 @@ def resolve_refs(refs, node_intervals, unknowns):
     return resolved
 
 
+class SaveUnpickler(pickle.Unpickler):
+    """
+    Restricts unpickling to increase security.
+    """
+
+    def find_class(self, module, name):
+        """
+        Restrict classes that can be unpickled.
+        """
+
+        if module != '__main__' or name not in ('PatternTrie', 'PatternNode'):
+            raise pickle.UnpicklingError('Unknown object to load {}.{}'.format(module, name))
+
+        return super().find_class(module, name)
+
+
 def save_fdb(filename, db):
     """
     Save fingerprints into a filename
@@ -1043,7 +1058,7 @@ def load_fdb(filename):
     """
 
     with io.BufferedReader(gzip.open(filename, 'rb')) as fd:
-        return pickle.load(fd)
+        return SaveUnpickler(fd).load()
 
 
 def build_signature_matcher(nodes):

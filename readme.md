@@ -3,7 +3,7 @@
 IDA plugin for collecting functions, data, types and comments from analysed binaries
 and fuzzy matching them in another binaries.
 
-> autor: Jan Prochazka<br>
+> author: Jan Prochazka<br>
 > licence: none, public domain<br>
 > home: https://github.com/jendabenda/fingermatch<br>
 
@@ -57,7 +57,7 @@ and fuzzy matching them in another binaries.
 
 ## Fingerprints
 Function fingerprints are based on control flow traces allowing to match the same function
-with shuffled basic block, different register allocation or instruction scheduling.
+with shuffled basic block starts, different register allocation or instruction scheduling.
 Fingerprints of data, types and comments are also matched. In addition matching considers
 whole reference graph, so it has high chance to pinpoint correct names. Matching is tuned
 to have low false positive matches.
