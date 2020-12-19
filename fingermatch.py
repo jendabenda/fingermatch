@@ -1037,7 +1037,7 @@ class SaveUnpickler(pickle.Unpickler):
         Restrict classes that can be unpickled.
         """
 
-        if module != '__main__' or name not in ('PatternTrie', 'PatternNode'):
+        if module != __name__ or name not in ('PatternTrie', 'PatternNode'):
             raise pickle.UnpicklingError('Unknown object to load {}.{}'.format(module, name))
 
         return super().find_class(module, name)
