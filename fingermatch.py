@@ -25,7 +25,7 @@ Matching process
  * unambigous candidates for functions and data locations are resolved
  * algorithm is tuned to output low number of false positives
  * names, types and comments are applied to matched items
- * matched items are written into csv file
+ * matched items are written into json file
  * unmatched guesses are writen into json file in format
    { place_ea: { source_ea: [ name_a, name_b, ...], ... }, ... }
 
@@ -69,16 +69,15 @@ Todo
 """
 
 import sys
-import csv
 import json
 import bisect
 import math
-import time
 import importlib
 import gzip
 import io
 import re
 import pickle
+from collections import namedtuple
 
 import idaapi as ida
 
@@ -88,6 +87,7 @@ strong_match_fn_size = 16  # minimum instructions to consider function a strong 
 strong_match_data_size = 10  # minimum size in bytes to consider data a strong match
 useless_bytes = set([0x00, 0x01, 0x02, 0x04, 0x08, 0x7f, 0x80, 0xff])  # useless bytes for data fingerprinting
 useful_bytes_count = 3  # minimum number of useful bytes for data fingerprinting
+max_candidates = 100  # maximum number of candidates per one offset
 
 
 class UserInterrupt(Exception):
@@ -104,50 +104,6 @@ class OperationFailed(Exception):
     pass
 
 
-class ProgressBar:
-    """
-    Text UI progress bar
-    """
-
-    def __init__(self, text):
-        self.bars = 0
-        self.max_bars = 50
-        self.char = '='
-        self.start = time.monotonic()
-
-        sys.stdout.write(text)
-        #sys.stdout.write('[')
-
-
-    def update(self, value):
-        """
-        Update progress bar
-        """
-
-        bars = int(max(0, min(value, 1)) * self.max_bars)
-        new_bars = max(0, bars - self.bars)
-        self.bars = bars
-        if new_bars > 0:
-            #sys.stdout.write(self.char * new_bars)
-            pass
-
-        if ida.user_cancelled():
-            raise UserInterrupt()
-
-
-    def finish(self):
-        """
-        Finish progres `bar progression
-        """
-
-        self.update(1)
-        #sys.stdout.write(']  took {:.2f}s\n'.format(time.monotonic() - self.start))
-        sys.stdout.write('\n')
-
-        if ida.user_cancelled():
-            raise UserInterrupt()
-
-
 class IntervalTree:
     """
     Interval "tree", assuming small ammount of overlaps.
@@ -159,58 +115,69 @@ class IntervalTree:
         Build interval data structure
         """
 
-        intervals = sorted(intervals, key=lambda x: x[0])
+        intervals = sorted(intervals, key=lambda interval: interval[0])
 
-        sequence = []
+        # find overlapping intervals
+        overlaps = []
         starts = []
         if intervals:
-            # find overlapping intervals
-            overlap = [intervals[0]]
+            overlap = []
             overlap_end = intervals[0][1]
-            for interval in intervals[1:]:
+            for interval in intervals:
                 start, end, data = interval
                 if overlap_end > start:
                     overlap_end = max(overlap_end, end)
                     overlap.append(interval)
                 else:
-                    if len(overlap) == 1:
-                        sequence.append((overlap[0][0], overlap[0][1], overlap[0][2], None))
-                    else:
-                        sequence.append((overlap[0][0], overlap_end, None, overlap))
+                    overlaps.append((overlap[0][0], overlap_end, overlap))
                     starts.append(overlap[0][0])
                     overlap = [interval]
                     overlap_end = end
-            if len(overlap) == 1:
-                sequence.append((overlap[0][0], overlap[0][1], overlap[0][2], None))
-            else:
-                sequence.append((overlap[0][0], overlap_end, None, overlap))
+            overlaps.append((overlap[0][0], overlap_end, overlap))
             starts.append(overlap[0][0])
 
         self.starts = starts
-        self.intervals = sequence
+        self.overlaps = overlaps
 
 
-    def find(self, point):
+    def find_point(self, point):
         """
-        Find first interval containing given point and return interval data
+        Find intervals containing given point and return interval data
         """
 
         index = bisect.bisect(self.starts, point) - 1
         if index == -1:
-            return None
+            return []
 
-        start, end, data, overlap = self.intervals[index]
-        if point < start or point >= end:
-            return None
+        start, end, intervals = self.overlaps[index]
+        return [data for start, end, data in intervals if start <= point < end]
 
-        if overlap is None:
-            return data
+
+    def find_range(self, start_point, end_point):
+        """
+        Find intervals overlapping with given range
+        """
+
+        start_index = max(0, bisect.bisect(self.starts, start_point) - 1)
+        end_index = bisect.bisect(self.starts, end_point)
+
+        return [
+            data
+            for start, end, intervals in self.overlaps[start_index:end_index]
+            for start, end, data in intervals
+            if start_point <= start < end_point or start <= start_point < end
+        ]
+
+
+    def find(self, start, end=None):
+        """
+        Finds overlapping intervals with given point or range
+        """
+
+        if end is None:
+            return self.find_point(start)
         else:
-            for start, end, data in overlap:
-                if start <= point < end:
-                    return data
-
-            return None
+            return self.find_range(start, end)
 
 
 class PatternNode:
@@ -285,6 +252,21 @@ class PatternTrie:
                         data.extend(next_node.data)
 
         return data, next_nodes
+
+
+def progress(iterable=None):
+    """
+    Make computation responsive
+    """
+
+    if iterable is None:
+        if ida.user_cancelled():
+            raise UserInterrupt()
+    else:
+        for item in iterable:
+            yield item
+            if ida.user_cancelled():
+                raise UserInterrupt()
 
 
 fnv_start = 0xcbf29ce484222325
@@ -406,9 +388,8 @@ def collect_types():
     # collect comments
     types = []
     ordinal_count = ida.get_ordinal_qty(None)
-    progress = ProgressBar('collecting types  ')
-    for ordinal in range(1, ordinal_count + 1):
-        progress.update(ordinal / (ordinal_count + 1))
+    print('collecting types  ')
+    for ordinal in progress(range(1, ordinal_count + 1)):
         ttuple = ida.get_numbered_type(None, ordinal)
         if ttuple is None:
             continue
@@ -492,7 +473,6 @@ def collect_types():
                 'tdecl': tdecl,
                 'sync': ida.is_autosync(name, ttuple[0]),
             })
-    progress.finish()
 
     return types
 
@@ -817,10 +797,8 @@ def fingerprint_functions(segments):
     tinfo = ida.tinfo_t()
     count = ida.get_func_qty()
     functions = []
-    progress = ProgressBar('  functions  ')
-    for n in range(count):
-        progress.update(n / count)
-
+    print('  functions  ')
+    for n in progress(range(count)):
         # gather info
         function = ida.getn_func(n)
         fn_start = function.start_ea
@@ -891,7 +869,6 @@ def fingerprint_functions(segments):
             'public': ida.is_public_name(fn_start),
             'weak': ida.is_weak_name(fn_start),
             'strong': instruction_count >= strong_match_fn_size})
-    progress.finish()
     ida.show_auto(0, ida.AU_NONE)
 
     return functions
@@ -920,12 +897,10 @@ def fingerprint_data_places(segments):
     """
 
     tinfo = ida.tinfo_t()
-    progress = ProgressBar('  data  ')
+    print('  data  ')
     data = []
     count = ida.get_nlist_size()
-    for n in range(count):
-        progress.update(n / count)
-
+    for n in progress(range(count)):
         # collect information
         data_start = ida.get_nlist_ea(n)
         ida.show_auto(data_start, ida.AU_USED)
@@ -987,19 +962,21 @@ def fingerprint_data_places(segments):
             'public': ida.is_public_name(data_start),
             'weak': ida.is_weak_name(data_start),
             'strong': data_size >= strong_match_data_size})
-    progress.finish()
     ida.show_auto(0, ida.AU_NONE)
 
     return data
 
 
-def ref_to_symbol(ref, node):
+def ref_to_symbol(ref, nodes):
     """
     Converts reference to symbolic value
     """
 
-    if node is None:
+    if not nodes:
         return None, None
+
+    # pick node with the smallest size
+    node = sorted(nodes, key=lambda node: node['size'])[0]
 
     ref_type = node['type']
     if ref_type == 'data':
@@ -1017,8 +994,8 @@ def resolve_refs(refs, node_intervals, unknowns):
 
     resolved = []
     for pos, ref in refs:
-        node = node_intervals.find(ref)
-        name, offset = ref_to_symbol(ref, node)
+        nodes = node_intervals.find(ref)
+        name, offset = ref_to_symbol(ref, nodes)
         if name is None:
             name = unknowns.setdefault(ref, (len(unknowns),))
 
@@ -1066,17 +1043,14 @@ def build_signature_matcher(nodes):
     Build datastructure for matching signatures
     """
 
-    progress = ProgressBar('building matching structures  ')
-    node_count = len(nodes)
+    print('building matching structures  ')
     patterns = PatternTrie()
     patterns_unknown = PatternTrie()
-    for n, node in enumerate(nodes):
-        progress.update(n / node_count)
+    for n, node in progress(enumerate(nodes)):
         if node['signature'] is not None:
             patterns.add(node['signature'], node)
             if node['strong']:
                 patterns_unknown.add(node['signature'], node)
-    progress.finish()
 
     return patterns, patterns_unknown
 
@@ -1086,21 +1060,18 @@ def verify_strongness(nodes):
     Verify if strong nodes are unambiguous, possibly removing strong attribute
     """
 
-    progress = ProgressBar('  checking uniqueness  ')
-    node_count = len(nodes)
+    print('  checking uniqueness  ')
     fingerprints = {}
-    for n, node in enumerate(nodes):
-        progress.update(n / node_count)
+    for n, node in progress(enumerate(nodes)):
         fprint = node['fingerprint']
         if fprint in fingerprints:
             node['strong'] = False
             fingerprints[fprint]['strong'] = False
         else:
             fingerprints[fprint] = node
-    progress.finish()
 
 
-def collect(filename):
+def collect(fingerdb_path, annotations_path):
     """
     Create fingerprints for whole db
     """
@@ -1112,7 +1083,6 @@ def collect(filename):
     nodes = []
     nodes.extend(fingerprint_functions(segments))
     nodes.extend(fingerprint_data_places(segments))
-    node_count = len(nodes)
 
     function_count = 0
     data_count = 0
@@ -1124,99 +1094,128 @@ def collect(filename):
 
     print('  function count  {}'.format(function_count))
     print('  data count  {}'.format(data_count))
-    print('postprocessing')
 
-    # resolve references
-    node_intervals = IntervalTree([(node['ea'], node['ea'] + node['size'], node) for node in nodes])
-    progress = ProgressBar('  resolving references  ')
-    unknowns = {}
-    reference_count = 0
-    for n, node in enumerate(nodes):
-        progress.update(n / node_count)
-        node['refs'] = resolve_refs(node['refs'], node_intervals, unknowns)
-        reference_count += len(node['refs'])
-    progress.finish()
-    print('  reference count  {}'.format(reference_count))
-    print('  reference unknowns  {}'.format(len(unknowns)))
+    types = None
 
-    # verify node strongness (must have unique fingerprint)
-    verify_strongness(nodes)
+    # save annotations
+    if annotations_path is not None:
+        print('saving annotations to  {}'.format(annotations_path))
+        save_annotations(nodes, annotations_path)
 
-    # signature matching
-    patterns, patterns_unknown = build_signature_matcher(nodes)
+    # save fingerdb
+    if fingerdb_path is not None:
+        # resolve references
+        node_intervals = IntervalTree([(node['ea'], node['ea'] + node['size'], node) for node in nodes])
+        print('  resolving references  ')
+        unknowns = {}
+        reference_count = 0
+        for n, node in progress(enumerate(nodes)):
+            node['refs'] = resolve_refs(node['refs'], node_intervals, unknowns)
+            reference_count += len(node['refs'])
+        print('postprocessing')
+        print('  reference count  {}'.format(reference_count))
+        print('  reference unknowns  {}'.format(len(unknowns)))
 
-    # name matching
-    names = {}
-    for node in nodes:
-        names[node['name']] = node
+        # verify node strongness (must have unique fingerprint)
+        verify_strongness(nodes)
 
-    # remove things not used for matching
-    for node in nodes:
-        del node['ea']
+        # signature matching
+        patterns, patterns_unknown = build_signature_matcher(nodes)
 
-    # collect types used for fingerprinted functions and data
-    types = collect_types()
+        # name matching
+        names = {}
+        for node in nodes:
+            names[node['name']] = node
 
-    # pickle fingerprints
-    print('saving fingerprints to  {}'.format(filename))
-    save_fdb(filename, {
-        'nodes': nodes,
-        'patterns': patterns,
-        'patterns_unknown': patterns_unknown,
-        'names': names,
-        'types': types,
-    })
+        # remove things not used for matching
+        for node in nodes:
+            del node['ea']
+
+        # collect types used for fingerprinted functions and data
+        types = collect_types()
+
+        # pickle fingerprints
+        print('saving fingerprints to  {}'.format(fingerdb_path))
+        save_fdb(fingerdb_path, {
+            'version': 0,
+            'nodes': nodes,
+            'patterns': patterns,
+            'patterns_unknown': patterns_unknown,
+            'names': names,
+            'types': types,
+        })
 
     print('done\n')
 
+    return nodes, types
 
-def match_refs(match_ea, match_refs, candidates, names):
+
+def save_annotations(nodes, filename):
     """
-    Match forward refrences to set of candidates
+    Save annotations into jsonl file
     """
 
-    # inspect all candidates
-    guesses = {}
-    for candidate in candidates:
-        # enumerate candidate refs
-        for mdst, (cpos, cdst, cdst_offset) in zip(match_refs, candidate['refs']):
-            cnode = names.get(cdst)
-            if cnode is None:
-                cname = cdst
-                cea = mdst
-            elif cnode['type'] == 'data':
-                # todo offsets needs to extend guesses with ranges
-                if cdst_offset == 0:
-                    cname = cnode['name']
-                    cea = mdst
-                else:
-                    #cea = mdst - cdst_offset
-                    continue
-            elif cnode['type'] == 'function':
-                cname = cnode['name']
+    with open(filename, 'w') as fd:
+        for node in nodes:
+            size = node['size'] if node['type'] == 'data' else 1
+            start = node['ea']
+            end = start + size
+            json.dump(((start, end), node['name']), fd)
+            fd.write('\n')
+
+
+def load_annotations(filename):
+    """
+    Load annotations from jsonl file
+    """
+
+    annotations = []
+    with open(filename) as fd:
+        for line in fd:
+            record = json.loads(line)
+            annotations.append(GuessNode(ea=tuple(record[0]), name=record[1]))
+
+    return set(annotations)
+
+
+# Graph of guesses
+GuessNode = namedtuple('GuessNode', ('ea', 'name'))
+Guess = namedtuple('Guess', ('node', 'refs', 'tag'))
+
+# Graph group tags
+guess_weak = 0
+guess_strong = 1
+
+
+def match_refs(trace_refs, candidate, names):
+    """
+    Match forward refrences for a candidate
+    """
+
+    refs = []
+    for mdst, (cpos, cdst, cdst_offset) in zip(trace_refs, candidate['refs']):
+        cnode = names.get(cdst)
+        if cnode is None:
+            cea = mdst
+            csize = 1
+        elif cnode['type'] == 'data':
+            if cdst_offset == 0:
                 cea = mdst
             else:
-                assert False, 'unknown node type {}'.cnode['type']
+                cea = mdst - cdst_offset
+            csize = cnode['size']
+        elif cnode['type'] == 'function':
+            cea = mdst
+            csize = 1
+        else:
+            assert False, 'unknown node type {}'.cnode['type']
 
-            evidence = guesses.setdefault(cea, {})
-            drafts = evidence.setdefault(match_ea, set())
-            drafts.add(cname)
+        refs.append(GuessNode((cea, cea + csize), cdst))
 
-    return guesses
-
-
-def merge_guesses(a, b):
-    """
-    Merge second guesses into the first ones
-    """
-
-    for b_ea, b_evidence in b.items():
-        for b_source, b_drafts in b_evidence.items():
-            a_evidence = a.setdefault(b_ea, {})
-            a_evidence[b_source] = a_evidence.get(b_source, set()) | b_drafts
+    return refs
 
 
-def match_function_candidates(start, end, candidates, names, guesses, position_to_ea):
+def match_function_candidates(start, end, candidates, guesses, position_to_ea, names):
     """
     Match list of candidates on specified binary location
     """
@@ -1337,26 +1336,22 @@ def match_function_candidates(start, end, candidates, names, guesses, position_t
         return
     candidates = survivals
 
-    # match references
-    guesses_from_refs = match_refs(start, trace_refs, candidates, names)
+    # todo remember candidates behind limit
+    candidates = candidates[:max_candidates]
 
     # update position to ea map
     for candidate in candidates:
         position_to_ea[(candidate['name'], start)] = cposition_to_ea
 
     # update guesses
-    only_candidate = len(candidates) == 1
     for candidate in candidates:
-        match_source = 'strong' if only_candidate and candidate['strong'] else 'weak'
-        evidence = guesses.setdefault(start, {})
-        drafts = evidence.setdefault(match_source, set())
-        drafts.add(candidate['name'])
-
-    # merge guesses from forward refs
-    merge_guesses(guesses, guesses_from_refs)
+        node = GuessNode((start, start + 1), candidate['name'])
+        tag = guess_strong if candidate['strong'] else guess_weak
+        refs = match_refs(trace_refs, candidate, names)
+        guesses.append(Guess(node, refs, tag))
 
 
-def match_functions(segments, patterns, names, guesses, position_to_ea):
+def match_functions(segments, patterns, guesses, position_to_ea, names):
     """
     Match function fingerpints agains current IDA analysis state
     """
@@ -1364,10 +1359,9 @@ def match_functions(segments, patterns, names, guesses, position_to_ea):
     # enumerate and match functions
     explored = []
     count = ida.get_func_qty()
-    progress = ProgressBar('  functions  ')
-    for n in range(count):
-        progress.update(n / count)
-
+    print('  functions  ')
+    for n in progress(range(count)):
+        # get function info
         function = ida.getn_func(n)
         fn_start = function.start_ea
         fn_end = function.end_ea
@@ -1382,8 +1376,8 @@ def match_functions(segments, patterns, names, guesses, position_to_ea):
         signature_bytes = ida.get_bytes(fn_start, size)
         snodes = None
         candidates = []
-        for n in range(size):
-            candidates, snodes = patterns.match(signature_bytes[n], snodes)
+        for s in range(size):
+            candidates, snodes = patterns.match(signature_bytes[s], snodes)
             if not snodes:
                 candidates = []
                 break
@@ -1392,8 +1386,7 @@ def match_functions(segments, patterns, names, guesses, position_to_ea):
             continue
 
         # match candidates function trace
-        match_function_candidates(fn_start, fn_end, candidates, names, guesses, position_to_ea)
-    progress.finish()
+        match_function_candidates(fn_start, fn_end, candidates, guesses, position_to_ea, names)
     ida.show_auto(0, ida.AU_NONE)
 
     return explored
@@ -1414,16 +1407,17 @@ def match_data_candidates(start, data_bytes, candidates, guesses):
     if not candidates:
         return
 
+    # todo remember candidates behind limit
+    candidates = candidates[:max_candidates]
+
     # update guesses
-    only_candidate = len(candidates) == 1
     for candidate in candidates:
-        match_source = 'strong' if only_candidate and candidate['strong'] else 'weak'
-        evidence = guesses.setdefault(start, {})
-        drafts = evidence.setdefault(match_source, set())
-        drafts.add(candidate['name'])
+        node = GuessNode((start, start + candidate['size']), candidate['name'])
+        tag = guess_strong if candidate['strong'] else guess_weak
+        guesses.append(Guess(node, [], tag))
 
 
-def match_data(segments, patterns, names, guesses):
+def match_data(segments, patterns, guesses, names):
     """
     Match data against current IDA analysis state
     """
@@ -1431,10 +1425,8 @@ def match_data(segments, patterns, names, guesses):
     # enumerate and match data
     count = ida.get_nlist_size()
     explored = []
-    progress = ProgressBar('  data  ')
-    for n in range(count):
-        progress.update(n / count)
-
+    print('  data  ')
+    for n in progress(range(count)):
         # collect information
         data_start = ida.get_nlist_ea(n)
         flags = ida.get_flags(data_start)
@@ -1463,163 +1455,188 @@ def match_data(segments, patterns, names, guesses):
 
         # fingerprint match
         match_data_candidates(data_start, data_bytes, candidates, guesses)
-    progress.finish()
     ida.show_auto(0, ida.AU_NONE)
 
     return explored
 
 
-def prune_guesses(guesses, matched_eas, matched_names):
+def verify_matches(matches, annotations):
     """
-    Prune guesses based on matched evidence
+    Compute matches score against annotations
     """
 
-    # prune guesses
-    for ea in matched_eas:
-        if ea in guesses:
-            del guesses[ea]
+    # remove unknowns
+    stripped_matches = set(ea_name for ea_name in matches if isinstance(ea_name[1], str))
 
-    # prune evidence drafts by matched items
-    matched_names_set = set(matched_names)
-    for ea, evidence in guesses.items():
-        for source in list(evidence):
-            evidence[source] -= matched_names_set
-            if not evidence[source]:
-                del evidence[source]
+    # compute metrics
+    fps = sorted(stripped_matches - annotations)
+    tp = len(stripped_matches & annotations)
+    fp = len(fps)
+    fn = len(annotations - stripped_matches)
+    precision = tp / (tp + fp) if tp + fp > 0 else 0
+    recall = tp / (tp + fn) if tp + fn > 0 else 0
+    f1 = 2 * precision * recall / ((precision + recall) if precision + recall > 0 else 0)
 
-    # prune evidence source by matched items
-    for ea, evidence in guesses.items():
-        strong_sources = set(source for source in evidence if source in matched_eas)
-        if strong_sources:
-            for source in list(evidence):
-                if source not in strong_sources:
-                    del evidence[source]
+    print('annotations')
 
-    # prune empty guesses
-    for ea in list(guesses):
-        if not guesses[ea]:
-            del guesses[ea]
+    # show false positives
+    for ea, name in fps:
+        print('  fp  {}, {}'.format(hex(ea[0]), name))
+
+    # show metrics
+    print('  precision  {:.3f}'.format(precision))
+    print('  recall  {:.3f}'.format(recall))
+    print('  f1 score  {:.3f}'.format(f1))
 
 
-def match_evidence(matched_eas, matched_names, guesses, names):
+def match_evidence(guesses, names):
     """
-    Match items from evidence fingerprints at given evel
+    Match items from fingerprint evidence
     """
 
     print('resolving guesses')
-    unambiguous_eas = {}
-    unambiguous_refs = {}
-    while True:
-        if ida.user_cancelled():
-            raise UserInterrupt()
+    print('  guesses  {}'.format(len(guesses)))
 
-        # find unambiguous candidates
-        added = True
-        new_unambiguous_eas = {}
-        while added:
-            added = False
-            for ea, evidence in guesses.items():
-                if ea in unambiguous_eas:
-                    continue
-                drafts = set.intersection(*evidence.values())
-                if (len(drafts) == 1 and
-                    any(isinstance(source, str) or source in unambiguous_eas for source in evidence)):
-                    draft = drafts.pop()
-                    if draft not in matched_names:
-                        new_unambiguous_eas[ea] = draft
-                        unambiguous_eas[ea] = draft
-                        added = True
+    # todo strip guessnode type
 
-        # find unambiguous references
-        for ea in new_unambiguous_eas:
-            for source in guesses.get(ea, []):
-                if source in unambiguous_eas:
-                    refs = unambiguous_refs.setdefault(source, set())
-                    refs.add(ea)
-                    refs = unambiguous_refs.setdefault(ea, set())
-                    refs.add(source)
+    # scores for unambiguous subgraph nodes
+    score_weak = 1
+    score_strong = 2
+    score_threshold = 3
 
-        # create unambiguous subgraphs
-        subgraphs = []
-        visited = set()
-        for ea in unambiguous_eas:
-            if ea in matched_eas:
+    # node to guess index
+    node_to_guess = {guess.node: guess for guess in guesses}
+
+    # find consistent subgraphs
+    seen = set()
+    consistent_nodes = {}
+    consistent_subgraphs = []
+    for guess in progress(guesses):
+        node = guess.node
+        if node in seen:
+            continue
+
+        ida.show_auto(node.ea[0], ida.AU_USED)
+
+        # create subgraph
+        score = 0
+        subgraph = set()
+        stack = set([node])
+        while stack:
+            node = stack.pop()
+            subgraph.add(node)
+
+            node_guess = node_to_guess.get(node)
+            if node_guess is None:
                 continue
 
-            subgraph = set()
-            stack = [ea]
-            while stack:
-                ea = stack.pop()
-                if ea in visited:
-                    continue
-
-                subgraph.add(ea)
-                visited.add(ea)
-                if ea in unambiguous_refs:
-                    stack.extend(unambiguous_refs[ea])
-            if subgraph:
-                subgraphs.append(subgraph)
-
-        # score subgraphs
-        score_strong = 3
-        score_weak = 1
-        score_threshold = 3
-        score_conflict = -1
-        strong_subgraphs = []
-        for graph in subgraphs:
-            score = 0
-            for ea in graph:
-                name = unambiguous_eas[ea]
-                if name in names and names[name]['strong']:
-                    score += score_strong
-                else:
-                    score += score_weak
-            if score >= score_threshold:
-                strong_subgraphs.append((score, graph))
-        strong_subgraphs.sort(key=lambda score_graph: -score_graph[0])
-
-        # inspect all strong subgraphs, create matches
-        new_matched_eas = {}
-        new_matched_names = {}
-        used_names = set()
-        for score, graph in strong_subgraphs:
-            # check name conflicts
-            conflicts = set()
-            for ea in graph:
-                name = unambiguous_eas[ea]
-                if name in used_names:
-                    score += 2 * score_conflict if name in conflicts else score_conflict
-                    conflicts.add(name)
-                used_names.add(name)
-
-            if score < score_threshold:
+            next_subgraph_score = consistent_nodes.get(node)
+            if next_subgraph_score is not None:
+                next_subgraph, next_score = next_subgraph_score
+                score += next_score
+                subgraph.update(next_subgraph)
                 continue
 
-            # add graph to matches
-            for ea in graph:
-                if ea in matched_eas:
-                    continue
+            score += score_strong if node_guess.tag == guess_strong else score_weak
+            seen.add(node)
+            for ref in node_guess.refs:
+                if ref not in subgraph:
+                    stack.add(ref)
 
-                name = unambiguous_eas[ea]
-                if name in conflicts:
-                    continue
+        # check subgraph name consistency
+        subgraph_names = set(node.name for node in subgraph)
+        if len(subgraph_names) != len(subgraph):
+            continue
 
-                new_matched_eas[ea] = name
-                new_matched_names[name] = ea
+        # check subgraph range consistency
+        subgraph_ranges = IntervalTree((*node.ea, None) for node in subgraph)
+        if any(len(subgraph_ranges.find(*node.ea)) != 1 for node in subgraph):
+            continue
 
-        if not new_matched_eas:
+        # save consistent nodes with subgraph
+        for node in subgraph:
+            consistent_nodes[node] = None
+        consistent_nodes[guess.node] = (subgraph, score)
+        consistent_subgraphs.append((subgraph, score))
+
+    guesses = [node_to_guess[node] for node in consistent_nodes if node in node_to_guess]
+    consistent_subgraphs.sort(key=lambda x: -x[1])
+
+    # rescore
+    """
+    node_scores = {}
+    for subgraph, score in consistent_subgraphs:
+        for node in subgraph:
+            node_scores[node] = node_scores.get(node, 0) + score
+
+    rescored_subgraphs = []
+    for subgraph, score in consistent_subgraphs:
+        rescored_subgraphs.append((subgraph, sum(node_scores[node] for node in subgraph)))
+    consistent_subgraphs = rescored_subgraphs
+    """
+
+    # iteratively create match list
+    matches = set()
+    for subgraph, score in progress(consistent_subgraphs):
+        ida.show_auto(next(iter(subgraph)).ea[0], ida.AU_USED)
+
+        # pick unexplored subgraph
+        if score < score_threshold:
             break
+        unexplored_subgraph = subgraph - matches
+        if not unexplored_subgraph:
+            continue
 
-        matched_eas.update(new_matched_eas)
-        matched_names.update(new_matched_names)
+        matched_names = set(node.name for node in unexplored_subgraph)
+        matched_ranges = IntervalTree((*node.ea, None) for node in unexplored_subgraph)
 
-        # prune guesses
-        prune_guesses(guesses, new_matched_eas, new_matched_names)
+        # check consistency with matches
+        if all(match in unexplored_subgraph or (match.name not in matched_names and not matched_ranges.find(*match.ea)) for match in matches):
+            matches.update(unexplored_subgraph)
+
+    # gather inconsistent nodes
+    matched_ranges = IntervalTree((*ea, None) for ea, name in matches)
+    matched_names = {name for ea, name in matches}
+    inconsistent_nodes = set()
+    for guess in progress(guesses):
+        node = guess.node
+
+        ida.show_auto(node.ea[0], ida.AU_USED)
+
+        if node not in matches and (node.name in matched_names or matched_ranges.find(*node.ea)):
+            inconsistent_nodes.add(node)
+            continue
+
+        if any(ref not in matches and (ref.name in matched_names or matched_ranges.find(*ref.ea)) for ref in guess.refs):
+            inconsistent_nodes.add(node)
+
+    # todo verify expansion
+    # expand inconsistent nodes with back reference search
+    while progress(True):
+        new_guesses = []
+        for guess in guesses:
+            if guess.node in inconsistent_nodes:
+                continue
+
+            ida.show_auto(guess.node.ea[0], ida.AU_USED)
+
+            if any(ref in inconsistent_nodes for ref in guess.refs):
+                inconsistent_nodes.add(guess.node)
+            else:
+                new_guesses.append(guess)
+        if len(new_guesses) == len(guesses):
+            break
+        guesses = new_guesses
+
+    ida.show_auto(0, ida.AU_NONE)
+
+    # compile guesses
+    guesses = [guess for guess in guesses if guess.node not in matches]
 
     # print results
     data_count = 0
     function_count = 0
-    for ea, name in matched_eas.items():
+    for ea, name in matches:
         node = names.get(name)
         if node is not None and node['type'] == 'function':
             function_count +=  1
@@ -1630,8 +1647,10 @@ def match_evidence(matched_eas, matched_names, guesses, names):
     print('  data matches  {}'.format(data_count))
     print('  unresolved guesses  {}'.format(len(guesses)))
 
+    return matches, guesses
 
-def match_unknown(segments, explored, patterns, names, guesses, position_to_ea, exclude):
+
+def match_unknown(segments, explored, patterns, guesses, position_to_ea, names):
     """
     Match unknown areas
     """
@@ -1641,19 +1660,17 @@ def match_unknown(segments, explored, patterns, names, guesses, position_to_ea, 
 
     # enumerate segments
     for name, segment_start, segment_end, segment_type in list_segments():
-        progress = ProgressBar('  segment {}  '.format(name))
+        print('  segment {}  '.format(name))
         segment_size = segment_end - segment_start
         segment_bytes = ida.get_bytes(segment_start, segment_size)
 
         # collect candidates for each byte
         n = 0
         while n < segment_size:
-            progress.update(n / segment_size)
-
             # skip already explored areas
             interval_end = explored_intervals.find(segment_start + n)
-            if interval_end is not None:
-                n = interval_end - segment_start
+            if interval_end:
+                n = interval_end[-1] - segment_start
                 continue
 
             # find candidates inside moving window
@@ -1665,21 +1682,19 @@ def match_unknown(segments, explored, patterns, names, guesses, position_to_ea, 
                 if not snodes:
                     break
 
-                fn_candidates = [c for c in candidates if c['type'] == 'function'
-                    if exclude is None or c['name'] not in exclude]
-                data_candidates = [c for c in candidates if c['type'] == 'data'
-                    if exclude is None or c['name'] not in exclude]
+                fn_candidates = [c for c in candidates if c['type'] == 'function']
+                data_candidates = [c for c in candidates if c['type'] == 'data']
 
                 # match functions
                 if fn_candidates:
-                    match_function_candidates(start, segment_end, fn_candidates, names, guesses, position_to_ea)
+                    match_function_candidates(start, segment_end, fn_candidates, guesses, position_to_ea, names)
 
                 # match data
                 if data_candidates:
                     sizes = {}
                     for candidate in candidates:
-                        group = sizes.setdefault(candidate['size'], [])
-                        group.append(candidate)
+                        guess = sizes.setdefault(candidate['size'], [])
+                        guess.append(candidate)
 
                     for size, candidates in sizes.items():
                         if start + size >= segment_end:
@@ -1687,23 +1702,20 @@ def match_unknown(segments, explored, patterns, names, guesses, position_to_ea, 
                         match_data_candidates(start, segment_bytes[start:start + size], candidates, guesses)
 
             n += 1
-        progress.finish()
         ida.show_auto(0, ida.AU_NONE)
 
 
-def apply_matches(matched_eas, names, imported_types, explored, position_to_ea):
+def matches_apply(matched_eas, names, imported_types, explored, position_to_ea):
     """
     Aplies matched items
     """
 
-    progress = ProgressBar('applying matches  ')
-    match_count = len(matched_eas)
+    print('applying matches  ')
     applied_functions = 0
     applied_data = 0
     applied_comments = 0
     applied_names = {}
-    for n, (ea, name) in enumerate(matched_eas.items()):
-        progress.update(n / match_count)
+    for n, (ea, name) in progress(enumerate(matched_eas.items())):
         if name not in names:
             continue
 
@@ -1776,58 +1788,52 @@ def apply_matches(matched_eas, names, imported_types, explored, position_to_ea):
             if ida.parse_decl(tinfo, None, tdecl_escaped, ida.PT_SIL) is not None:
                 ida.set_tinfo(ea, tinfo)
 
-    progress.finish()
     ida.show_auto(0, ida.AU_NONE)
     import_types_rename(imported_types)
 
     return applied_names, (applied_functions, applied_data, applied_comments)
 
 
-def save_matches(filename, matched_eas, names):
+def save_matches(filename, matches):
     """
-    Save matches to a csv file
+    Save matches to a json file
     """
 
     print('writing matches into  {}'.format(filename))
 
     with open(filename, 'wt', encoding='utf8') as fd:
-        writer = csv.writer(fd)
-        for ea, name in sorted(matched_eas.items()):
-            node = names.get(name)
-            if node is not None:
-                writer.writerow([hex(ea), node['type'], name])
+        json_guesses = {hex(start): name for (start, end), name in matches}
+        json.dump(json_guesses, fd, indent=2, sort_keys=True)
 
-
-def save_guesses(filename, guesses, names):
+def save_guesses(filename, guesses):
     """
     Save guesses into json file
     """
     print('writing guesses into  {}'.format(filename))
 
     json_guesses = {}
-    for ea, evidence in guesses.items():
-        json_evidence = {}
-        for source, drafts in evidence.items():
-            json_drafts = [draft if draft in names else 'unknown_{}'.format(draft[0]) for draft in drafts]
-            json_source = source if isinstance(source, str) else hex(source)
-            json_evidence[json_source] = sorted(json_drafts)
-
-        if not json_evidence:
-            continue
-        json_guesses[hex(ea)] = json_evidence
+    for guess in guesses:
+        name = guess.node.name if isinstance(guess.node.name, str) else 'unknown_{}'.format(guess.node.name[0])
+        ea = guess.node.ea[0]
+        names = json_guesses.setdefault(ea, set())
+        names.add(name)
+    json_guesses = {hex(ea): list(names) for ea, names in json_guesses.items()}
 
     with open(filename, 'wt', encoding='utf8') as fd:
         json.dump(json_guesses, fd, indent=2, sort_keys=True)
 
 
-def match(filename):
+def match(fingerdb_path, annotations_path, apply_matches):
     """
     Matches db against fingerprints
     """
 
     # unpickle fingerprints
-    print('loading fingerprints from  {}'.format(filename))
-    db = load_fdb(filename)
+    print('loading fingerprints from  {}'.format(fingerdb_path))
+    db = load_fdb(fingerdb_path)
+    version = db.get('version', -1)
+    if not isinstance(version, (int, float)) or version < 0:
+        raise OperationFailed('you have loaded old version of database, please recreate the database')
     nodes = db['nodes']
     patterns = db['patterns']
     patterns_unknown = db['patterns_unknown']
@@ -1838,41 +1844,51 @@ def match(filename):
 
     # match fingerprints
     print('matching')
-    guesses = {}
+    guesses = []
     position_to_ea = {}
     explored = []
     segments = list_segments()
-    explored.extend(match_functions(segments, patterns, names, guesses, position_to_ea))
-    explored.extend(match_data(segments, patterns, names, guesses))
-    match_unknown(segments, explored, patterns_unknown, names, guesses, position_to_ea, None)
+    explored.extend(match_functions(segments, patterns, guesses, position_to_ea, names))
+    explored.extend(match_data(segments, patterns, guesses, names))
+    match_unknown(segments, explored, patterns_unknown, guesses, position_to_ea, names)
 
     # resolve matches based on collected evidence
-    matched_eas = {}
-    matched_names = {}
-    match_evidence(matched_eas, matched_names, guesses, names)
+    matches, guesses = match_evidence(guesses, names)
 
-    # import types
-    if any(name in names and names[name]['type'] == 'function' for name in matched_names):
-        imported_types = import_types(types)
-    else:
-        print('did not match any functions, done\n')
-        return
+    # verify matches
+    if annotations_path:
+        annotations = load_annotations(annotations_path)
+        verify_matches(matches, annotations)
 
-    # apply names
-    applied, counts = apply_matches(matched_eas, names, imported_types, explored, position_to_ea)
-    fns_first, data_first, cmts_first = counts
+    # apply matches
+    if apply_matches:
+        matched_eas = {start: name for (start, end), name in matches}
+        matched_names = {name: start for (start, end), name in matches}
 
-    # save matches and guesses
-    idb = ida.get_path(ida.PATH_TYPE_IDB)
-    save_matches('{}.fingermatch_matches.csv'.format(idb), matched_eas, names)
-    save_guesses('{}.fingermatch_guesses.json'.format(idb), guesses, names)
+        # import types
+        if any(name in names and names[name]['type'] == 'function' for name in matched_names):
+            imported_types = import_types(types)
+        else:
+            print('did not match any functions, done\n')
+            return
 
-    print('results')
-    print('  imported types  {}'.format(len(imported_types)))
-    print('  applied functions  {}'.format(fns_first))
-    print('  applied data  {}'.format(data_first))
-    print('  applied comments  {}'.format(cmts_first))
-    print('done\n')
+        # apply names
+        applied, counts = matches_apply(matched_eas, names, imported_types, explored, position_to_ea)
+        fns_first, data_first, cmts_first = counts
+
+        # save matches and guesses
+        idb = ida.get_path(ida.PATH_TYPE_IDB)
+        save_matches('{}.fingermatch_matches.json'.format(idb), matches)
+        save_guesses('{}.fingermatch_guesses.json'.format(idb), guesses)
+
+        print('results')
+        print('  imported types  {}'.format(len(imported_types)))
+        print('  applied functions  {}'.format(fns_first))
+        print('  applied data  {}'.format(data_first))
+        print('  applied comments  {}'.format(cmts_first))
+        print('done\n')
+
+    return matches
 
 
 def fingermatch_merge(filenames, output_name, exclusions=None):
@@ -1883,168 +1899,49 @@ def fingermatch_merge(filenames, output_name, exclusions=None):
     exclusions: list of regexps, names matching any of these will be excluded
     """
 
-    # todo rewrite for the new fdb format
-    print('Not implemented yet')
-    """
-    if exclusions is None:
-        exclusions = []
-
-    # compile exclusions
-    re_exclusions = [re.compile(exclusion, re.I) for exclusion in exclusions]
-
-    # load databases
-    fdbs = {}
-    for filename in filenames:
-        print('loading fingerprints from  {}'.format(filename))
-        fdbs[filename] = load_fdb(filename)
-
-    names = {}
-    nodes = []
-
-    print('merging')
-
-    # find functions conflicts
-    name_to_function = {}
-    all_functions = 0
-    progress = ProgressBar('  functions  ')
-    for filename, fdb in fdbs.items():
-        for node in fdb['nodes']:
-            if node['type'] == 'function':
-                if all(rex.search(node['name']) is None for rex in re_exclusions):
-                    function = name_to_function.setdefault(node['name'], [])
-                    function.append(node)
-                all_functions += 1
-
-    # remove ambiguous functions
-    unambiguous_functions = []
-    progress.update(0.5)
-    for name, functions in name_to_function.items():
-        if len(functions) == 1:
-            unambiguous_functions.append(functions[0])
-    progress.finish()
-
-    # find data conflicts
-    name_to_data = {}
-    all_data = 0
-    for filename, fdb in fdbs.items():
-        for node in fdb['nodes']:
-            if node['type'] == 'data':
-                if all(rex.search(node['name']) is None for rex in re_exclusions):
-                    data = name_to_data.setdefault(node['name'], [])
-                    data.append(node)
-                all_data += 1
-
-    # remove ambiguous data
-    unambiguous_data = []
-    progress = ProgressBar('  data  ')
-    for name, data in name_to_data.items():
-        if len(data) == 1:
-            unambiguous_data.append(data[0])
-
-    # find type conflicts
-    name_to_type = {}
-    all_types = 0
-    progress.update(0.5)
-    for filename, fdb in fdbs.items():
-        for type in fdb['types']:
-            if all(rex.search(type['name']) is None for rex in re_exclusions):
-                types = name_to_type.setdefault(type['name'], [])
-                types.append(type)
-            all_types += 1
-    progress.finish()
-
-    # remove ambiguous types
-    unambiguous_types = []
-    count = len(name_to_type)
-    progress = ProgressBar('  types  ')
-    for n, (name, types) in enumerate(name_to_type.items()):
-        progress.update(n / count)
-        tinfos = [type['tinfo'] for type in types]
-        if len(set(tinfos)) == 1:
-            unambiguous_types.append(types[0])
-    progress.finish()
-
-    print('  used functions  {} / {}'.format(len(unambiguous_functions), all_functions))
-    print('  used data  {} / {}'.format(len(unambiguous_data), all_data))
-    print('  used types  {} / {}'.format(len(unambiguous_types), all_types))
-
-    print('postprocessing')
-
-    # merge functions and data
-    for node in unambiguous_functions:
-        nodes.append(node)
-        names[node['name']] = node
-    for node in unambiguous_data:
-        nodes.append(node)
-        names[node['name']] = node
-
-    # remove unknown references
-    unknown_count = 0
-    all_ref_count = 0
-    node_count = len(nodes)
-    progress = ProgressBar('  cleaning references  ')
-    for n, node in enumerate(nodes):
-        progress.update(n / node_count)
-        for pos, refs in node['refs'].items():
-            cleaned_refs = []
-            for ref in refs:
-                name, offset = ref
-                if name in names:
-                    cleaned_refs.append(ref)
-                else:
-                    cleaned_refs.append(((unknown_count,), offset))
-                    unknown_count += 1
-                all_ref_count += 1
-            node['refs'][pos] = cleaned_refs
-    progress.finish()
-    print('  cleaned references  {} / {}'.format(unknown_count, all_ref_count))
-
-    # verify node strongness (must have unique fingerprint)
-    verify_strongness(nodes)
-
-    # signature matching
-    patterns, patterns_unknown = build_signature_matcher(nodes)
-
-    # pickle fingerprints
-    print('saving fingerprints to  {}'.format(output_name))
-    save_fdb(output_name, {
-        'nodes': nodes,
-        'patterns': patterns,
-        'patterns_unknown': patterns_unknown,
-        'names': names,
-        'types': unambiguous_types,
-    })
-    """
+    raise NotImplementedError('Merging databases is not implemented yet')
 
 
-def fingermatch_collect(filename):
+def fingermatch_collect(fingerdb_path, annotations_path=None):
     """
     Collect functions, data, types and comments and save them into database
-    filename: path to fingerprint database to save collected items to
+
+    fingerdb_path: when provided create fingerprint database to save collected items to
+    annotations_path: when provided create a jsonl file with annotations
+
+    Return list of collected nodes, list of collected types
     """
+
+    if fingerdb_path is None and annotations_path is None:
+        raise ValueError('At least one of fingerdb_path and annotations_path must be provided')
 
     ida.show_wait_box('collecting fingerprints')
     try:
-        collect(filename)
+        return collect(fingerdb_path, annotations_path)
     except UserInterrupt:
-        print('user interrupted collecting fingerprints\n')
+        print('\nuser interrupted collecting fingerprints\n')
     except OperationFailed as exception:
         print(exception)
     finally:
         ida.hide_wait_box()
 
 
-def fingermatch_match(filename):
+def fingermatch_match(fingerdb_path, annotations_path=None, apply_matches=True):
     """
     Load fingerprints from a database and match them to current analysed binary
-    filname: path to fingerprin database to load fingerprints from
+
+    fingerdb_path: path to fingerprint database to load fingerprints from
+    annotations_path: when provided compute how successful matching was against annotations
+    apply_matches: when True apply matches to open analysis
+
+    Return set of found matches GuessNode, list of remaining guesses Guess
     """
 
     ida.show_wait_box('matching fingerprints')
     try:
-        match(filename)
+        return match(fingerdb_path, annotations_path, apply_matches)
     except UserInterrupt:
-        print('user interrupted matching fingerprints\n')
+        print('\nuser interrupted matching fingerprints\n')
     except OperationFailed as exception:
         print(exception)
     finally:
@@ -2089,9 +1986,9 @@ class FingerprintAction(ida.action_handler_t):
         Run fingerprinting
         """
 
-        filename = ida.ask_file(True, '*.fdb', 'Database to save fingerprints')
-        if filename is not None:
-            fingermatch_collect(filename)
+        fingerdb_path = ida.ask_file(True, '*.fdb', 'Database to save fingerprints')
+        if fingerdb_path is not None:
+            fingermatch_collect(fingerdb_path)
 
         return 1
 
@@ -2117,9 +2014,9 @@ class MatchAction(ida.action_handler_t):
         Run matching
         """
 
-        filename = ida.ask_file(False, '*.fdb', 'Open fingerprints database')
-        if filename is not None:
-            fingermatch_match(filename)
+        fingerdb_path = ida.ask_file(False, '*.fdb', 'Open fingerprints database')
+        if fingerdb_path is not None:
+            fingermatch_match(fingerdb_path)
 
         return 1
 
@@ -2206,3 +2103,83 @@ def PLUGIN_ENTRY():
     """
 
     return FingerMatch()
+
+
+def selftest_intervals():
+    """
+    testing intervals
+    """
+
+    intervals = [
+        (-20, -10, None),
+        (0, 10, 'a'),
+        (10, 20, 'b'),
+        (21, 30, 'c'),
+        (5, 25, 'abc'),
+        (21, 30, 'cc'),
+    ]
+
+    tree = IntervalTree(intervals)
+    assert tree.find(-1000) == []
+    assert tree.find(1000) == []
+    assert tree.find(0) == ['a']
+    assert tree.find(9) == ['a', 'abc']
+    assert tree.find(10) == ['abc', 'b']
+    assert tree.find(20) == ['abc']
+
+    assert tree.find(-1100, -1000) == []
+    assert tree.find(1000, 1100) == []
+    assert tree.find(-5, 35) == ['a', 'abc', 'b', 'c', 'cc']
+    assert tree.find(0, 1) == ['a']
+    assert tree.find(1, 5) == ['a']
+    assert tree.find(1, 6) == ['a', 'abc']
+    assert tree.find(10, 25) == ['abc', 'b', 'c', 'cc']
+
+    assert tree.find(-20, -10) == [None]
+
+
+def selftest_pattern_trie():
+    """
+    testing pattern trie
+    """
+
+    trie = PatternTrie()
+    trie.add([0, 1, 2], 'a')
+    trie.add([0, 1, 3], 'b')
+    trie.add([0, 2], 'c')
+    trie.add([0, None, 3], 'd')
+    trie.add([1, 3], 'e')
+    trie.add([1], 'e')
+
+    results, nodes = trie.match(0)
+    assert results == []
+    results, nodes = trie.match(1, nodes)
+    assert results == []
+    results, nodes = trie.match(3, nodes)
+    assert set(results) == {'b', 'd'}
+    results, nodes = trie.match(0, nodes)
+    assert results == [] and nodes == []
+
+    results, nodes = trie.match(1)
+    assert set(results) == {'e'}
+    results, nodes = trie.match(1, nodes)
+    assert results == [] and nodes == []
+
+
+def selftest_all():
+    """
+    Run selftest
+    """
+
+    print('running fingermatch selftests')
+    for fn in [
+        selftest_intervals,
+        selftest_pattern_trie,
+        ]:
+        print('  {}'.format(fn.__doc__.strip()))
+        fn()
+
+
+# run selftest if script is not activated as a plugin
+if __name__ == '__main__':
+    selftest_all()
