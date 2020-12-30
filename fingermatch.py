@@ -254,14 +254,16 @@ class PatternTrie:
         return data, next_nodes
 
 
-def progress(iterable=None):
+def progress(iterable):
     """
     Make computation responsive
     """
 
-    if iterable is None:
+    if iterable is True:
         if ida.user_cancelled():
             raise UserInterrupt()
+
+        return True
     else:
         for item in iterable:
             yield item
@@ -1631,7 +1633,7 @@ def match_evidence(guesses, names):
     ida.show_auto(0, ida.AU_NONE)
 
     # compile guesses
-    guesses = [guess for guess in guesses if guess.node not in matches]
+    unresolved_guesses = [guess for guess in guesses if guess.node not in matches]
 
     # print results
     data_count = 0
@@ -1645,9 +1647,9 @@ def match_evidence(guesses, names):
 
     print('  function matches  {}'.format(function_count))
     print('  data matches  {}'.format(data_count))
-    print('  unresolved guesses  {}'.format(len(guesses)))
+    print('  unresolved guesses  {}'.format(len(unresolved_guesses)))
 
-    return matches, guesses
+    return matches, unresolved_guesses
 
 
 def match_unknown(segments, explored, patterns, guesses, position_to_ea, names):
@@ -1869,7 +1871,7 @@ def match(fingerdb_path, annotations_path, apply_matches):
         if any(name in names and names[name]['type'] == 'function' for name in matched_names):
             imported_types = import_types(types)
         else:
-            print('did not match any functions, done\n')
+            print('did not match any functions, skipping\n')
             return
 
         # apply names
@@ -1886,7 +1888,7 @@ def match(fingerdb_path, annotations_path, apply_matches):
         print('  applied functions  {}'.format(fns_first))
         print('  applied data  {}'.format(data_first))
         print('  applied comments  {}'.format(cmts_first))
-        print('done\n')
+        print('\n')
 
     return matches
 
