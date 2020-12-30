@@ -36,8 +36,8 @@ and fuzzy matching them in another binaries.
 
 ## Python API
  * available from IDA console
- * `fingermatch_collect(filename)` - collects fingerprints and save them into fingerprint database
- * `fingermatch_match(filename)` - loads fingerprints from fingerprint database and match them against analysed binary
+ * `fingermatch_collect(fingerdb_path)` - collects fingerprints and save them into fingerprint database
+ * `fingermatch_match(fingerdb_path)` - loads fingerprints from fingerprint database and match them against analysed binary
 
 
 ## Libraries workflow
